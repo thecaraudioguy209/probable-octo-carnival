@@ -1,0 +1,100 @@
+1. Outbound SMS from Node.js
+
+You use an SDK to send messages via a secure API. Here’s an example using Twilio
+:
+
+Install Twilio SDK
+npm install twilio
+
+Sending SMS (Outbound)
+const twilio = require('twilio');
+const accountSid = process.env.TWILIO_SID;   // Store in secure env variable
+const authToken = process.env.TWILIO_TOKEN;  // Store in secure env variable
+const client = new twilio(accountSid, authToken);
+
+client.messages.create({
+    body: 'Hello, this is a test message!',
+    from: '+12345678901',   // Your Twilio number
+    to: '+15551234567'      // Destination mobile number
+}).then(message => {
+    console.log(`Message sent: ${message.sid}`);
+}).catch(err => {
+    console.error('Send error:', err);
+});
+
+
+Security: Always keep your credentials in environment variables or a secure vault.
+
+2. Inbound SMS to Node.js (Webhooks)
+
+When someone texts your number, Twilio (or your SMS provider) will POST the message to your secure HTTP(S) endpoint.
+You must run a Node.js server (e.g., Express) that accepts POST requests.
+
+Receiving SMS (Inbound)
+npm install express body-parser
+
+const express = require('express');
+const bodyParser = require('body-parser');
+const app = express();
+
+app.use(bodyParser.urlencoded({ extended: false }));
+
+app.post('/sms/inbound', (req, res) => {
+    const from = req.body.From;
+    const to = req.body.To;
+    const body = req.body.Body;
+
+    console.log(`Received SMS from ${from} to ${to}: ${body}`);
+
+    // Respond to sender if desired (optional)
+    res.set('Content-Type', 'text/xml');
+    res.send('<Response><Message>Thanks for your message!</Message></Response>');
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+    console.log(`SMS inbound server running on port ${PORT}`);
+});
+
+
+Register your webhook URL in your SMS provider's dashboard (e.g., https://yourdomain.com/sms/inbound).
+
+Security: Use HTTPS and validate incoming requests (Twilio signature validation
+), rate limiting, and authentication.
+
+3. Production Security Checklist
+
+HTTPS only for webhooks.
+
+Validate requests using your SMS provider’s request signature (prevents spoofing).
+
+Store credentials securely (never in code or repo).
+
+Rate limit and monitor inbound requests to prevent abuse.
+
+Audit logs for both sending and receiving.
+
+4. Other Providers
+
+You can swap Twilio for Nexmo/Vonage
+, Plivo
+, Bandwidth
+, Sinch
+, etc.—all follow the same outbound SDK + inbound webhook model. Their Node.js libraries and webhook payloads are similar.
+
+5. References & Next Steps
+
+Twilio Node.js Quickstart
+
+Twilio Webhook Security
+
+Nexmo Node.js SDK
+
+Plivo Node.js SDK
+
+OWASP SMS Security Guidance
+
+Summary Table
+Direction	Library/Service	Code Style	Secure?
+Outbound (send)	Twilio, Vonage	SDK/API call	Yes, if using HTTPS and env vars
+Inbound (recv)	Twilio, Vonage	Express webhook	Yes, if HTTPS and signature validation
