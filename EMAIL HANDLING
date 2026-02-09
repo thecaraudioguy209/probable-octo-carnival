@@ -1,0 +1,125 @@
+Haraka: Production Inbound and Outbound Mail in Node.js
+Getting Started (Inbound and Outbound)
+
+Install Haraka:
+
+npm install -g Haraka
+haraka -i /path/to/your/server
+cd /path/to/your/server
+
+
+Configure for Security and Multi-domain:
+
+Enable TLS:
+
+Generate SSL keys, place them in config/tls_key.pem and config/tls_cert.pem.
+
+In config/tls.ini:
+
+main.enabled=true
+main.key=./tls_key.pem
+main.cert=./tls_cert.pem
+
+
+Set Up Authentication:
+
+Edit config/auth.json:
+
+{
+  "users": {
+    "alice@example.com": "password1",
+    "bob@another.org": "password2"
+  }
+}
+
+
+Enable auth/flat_file plugin.
+
+Allow Only Secure Connections:
+
+In config/smtp.ini:
+
+max_unrecognized_commands=3
+max_errors=5
+require_tls=true
+
+
+Set Domains:
+
+Add to config/host_list:
+
+example.com
+another.org
+
+
+Configure Routing and Delivery:
+
+By default, Haraka will store inbound mail in data (or you can plug in a handler to deliver to your Rust/Node app, a database, Maildir, etc).
+
+Outbound mail can be relayed securely using the smtp_forward plugin, with per-domain relay settings.
+
+Outbound: Using Nodemailer (if needed in-app):
+
+const nodemailer = require('nodemailer');
+
+let transporter = nodemailer.createTransport({
+  host: 'smtp.yourrelay.com',
+  port: 587,
+  secure: false, // true for port 465, false for other ports
+  auth: {
+    user: 'alice@example.com',
+    pass: 'password1'
+  },
+  tls: { rejectUnauthorized: true }
+});
+
+transporter.sendMail({
+  from: '"Alice" <alice@example.com>',
+  to: 'recipient@external.org',
+  subject: 'Hello',
+  text: 'This is a test email',
+});
+
+Production Security Best Practices with Haraka/Node
+
+Always enable TLS and enforce STARTTLS for both inbound and outbound.
+
+Use strong, unique passwords for all users. Store secrets outside your codebase (env variables, secret managers).
+
+Limit relay to authenticated users; avoid open relay.
+
+Enable rate limits and spam/virus filtering (Haraka plugins available).
+
+Log and monitor all activity.
+
+Regularly update dependencies (Haraka has active maintenance).
+
+Haraka References
+
+Haraka Documentation
+
+Haraka Configuration
+
+Security Plugins
+
+Nodemailer Documentation
+
+TL;DR: Node.js + Haraka is Secure and Production-Grade
+
+Inbound SMTP: Haraka (Node.js) — production-grade, secure, multi-domain.
+
+Outbound SMTP: Haraka or Nodemailer (Node.js) — production-ready.
+
+Configuration: All via file or environment, very scriptable/extensible.
+
+Security: TLS everywhere, strong authentication, proven by real-world usage.
+
+Would you like:
+
+An example Haraka config for multi-domain/multi-user setup?
+
+A sample plugin for custom delivery/filtering logic?
+
+A ready-to-use Nodemailer script for sending with robust TLS and auth?
+
+Let me know your ideal workflow or what you want to automate—I can provide concrete code or config!
