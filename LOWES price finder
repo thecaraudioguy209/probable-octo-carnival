@@ -1,0 +1,2416 @@
+
+
+# AI-Powered Lowe's Price Finder
+
+A comprehensive tool using local Ollama AI models to find, verify, and analyze the best prices on Lowe's — with cross-comparison to Home Depot.
+
+---
+
+## Project Structure
+
+```
+lowes_price_finder/
+├── .env
+├── config.py
+├── main.py
+├── ai_engine.py
+├── lowes_scraper.py
+├── product_verifier.py
+├── deal_analyzer.py
+├── price_history.py
+├── result_formatter.py
+├── cross_compare.py
+├── requirements.txt
+└── data/
+    └── price_history.db
+```
+
+---
+
+## 1. `requirements.txt`
+
+```text
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+lxml>=5.1.0
+python-dotenv>=1.0.0
+rich>=13.7.0
+httpx>=0.27.0
+fake-useragent>=1.5.0
+Pillow>=10.0.0
+playwright>=1.44.0
+selectolax>=0.3.21
+```
+
+After install:
+```bash
+pip install -r requirements.txt
+playwright install chromium
+```
+
+---
+
+## 2. `.env`
+
+```env
+# ================================================
+# Ollama Configuration
+# ================================================
+OLLAMA_BASE_URL=http://localhost:11434
+OLLAMA_TEXT_MODEL=llama3.2:3b
+OLLAMA_VISION_MODEL=llava:7b
+
+# ================================================
+# Lowe's Search Settings
+# ================================================
+LOWES_SEARCH_METHOD=scrape
+MAX_PAGES=3
+MAX_RESULTS=25
+REQUEST_DELAY=2.5
+USE_BROWSER=true
+
+# ================================================
+# Cross-Comparison (Home Depot)
+# ================================================
+ENABLE_CROSS_COMPARE=true
+CROSS_COMPARE_SOURCES=homedepot
+
+# ================================================
+# AI Verification
+# ================================================
+MIN_MATCH_CONFIDENCE=70
+VERIFICATION_MODE=moderate
+
+# ================================================
+# Price History & Alerts
+# ================================================
+ENABLE_PRICE_HISTORY=true
+PRICE_DROP_ALERT_PCT=5.0
+
+# ================================================
+# Lowe's Specific
+# ================================================
+LOWES_STORE_ID=
+LOWES_ZIP_CODE=
+TRACK_STORE_INVENTORY=true
+```
+
+---
+
+## 3. `config.py`
+
+```python
+import os
+from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv()
+
+BASE_DIR = Path(__file__).resolve().parent
+
+
+class Config:
+    """Central configuration for the Lowe's Price Finder."""
+
+    # ── Ollama ──────────────────────────────────────────────
+    OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+    OLLAMA_TEXT_MODEL = os.getenv("OLLAMA_TEXT_MODEL", "llama3.2:3b")
+    OLLAMA_VISION_MODEL = os.getenv("OLLAMA_VISION_MODEL", "llava:7b")
+
+    # ── Lowe's ──────────────────────────────────────────────
+    LOWES_SEARCH_METHOD = os.getenv("LOWES_SEARCH_METHOD", "scrape")
+    MAX_PAGES = int(os.getenv("MAX_PAGES", "3"))
+    MAX_RESULTS = int(os.getenv("MAX_RESULTS", "25"))
+    REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "2.5"))
+    USE_BROWSER = os.getenv("USE_BROWSER", "true").lower() == "true"
+
+    # ── Store / Location ────────────────────────────────────
+    LOWES_STORE_ID = os.getenv("LOWES_STORE_ID", "")
+    LOWES_ZIP_CODE = os.getenv("LOWES_ZIP_CODE", "")
+    TRACK_STORE_INVENTORY = os.getenv("TRACK_STORE_INVENTORY", "true").lower() == "true"
+
+    # ── Cross-Comparison ────────────────────────────────────
+    ENABLE_CROSS_COMPARE = os.getenv("ENABLE_CROSS_COMPARE", "true").lower() == "true"
+    CROSS_COMPARE_SOURCES = [
+        s.strip()
+        for s in os.getenv("CROSS_COMPARE_SOURCES", "homedepot").split(",")
+        if s.strip()
+    ]
+
+    # ── AI Verification ─────────────────────────────────────
+    MIN_MATCH_CONFIDENCE = int(os.getenv("MIN_MATCH_CONFIDENCE", "70"))
+    VERIFICATION_MODE = os.getenv("VERIFICATION_MODE", "moderate")
+
+    # ── Price History ────────────────────────────────────────
+    ENABLE_PRICE_HISTORY = os.getenv("ENABLE_PRICE_HISTORY", "true").lower() == "true"
+    PRICE_DROP_ALERT_PCT = float(os.getenv("PRICE_DROP_ALERT_PCT", "5.0"))
+
+    # ── Paths ────────────────────────────────────────────────
+    DATA_DIR = BASE_DIR / "data"
+    DB_PATH = DATA_DIR / "price_history.db"
+
+    # ── Confidence thresholds by mode ────────────────────────
+    MODE_THRESHOLDS = {
+        "strict": 85,
+        "moderate": 70,
+        "loose": 55,
+    }
+
+    @classmethod
+    def ensure_dirs(cls):
+        cls.DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    @classmethod
+    def get_confidence_threshold(cls) -> int:
+        return cls.MODE_THRESHOLDS.get(cls.VERIFICATION_MODE, 70)
+```
+
+---
+
+## 4. `ai_engine.py`
+
+```python
+"""
+AI Engine – wraps Ollama for query understanding, image analysis,
+product verification, and recommendation generation.
+"""
+
+import json
+import re
+import base64
+import httpx
+from pathlib import Path
+from typing import Optional
+
+from config import Config
+
+
+class AIEngine:
+    """Interface to local Ollama models."""
+
+    def __init__(self):
+        self.base_url = Config.OLLAMA_BASE_URL.rstrip("/")
+        self.text_model = Config.OLLAMA_TEXT_MODEL
+        self.vision_model = Config.OLLAMA_VISION_MODEL
+        self.client = httpx.Client(timeout=120.0)
+
+    # ── low-level ────────────────────────────────────────────
+
+    def _generate(
+        self,
+        prompt: str,
+        model: Optional[str] = None,
+        images: Optional[list[str]] = None,
+        temperature: float = 0.3,
+    ) -> str:
+        model = model or self.text_model
+        payload = {
+            "model": model,
+            "prompt": prompt,
+            "stream": False,
+            "options": {"temperature": temperature},
+        }
+        if images:
+            payload["images"] = images
+
+        resp = self.client.post(f"{self.base_url}/api/generate", json=payload)
+        resp.raise_for_status()
+        return resp.json().get("response", "")
+
+    @staticmethod
+    def _image_to_base64(path: str) -> str:
+        data = Path(path).read_bytes()
+        return base64.b64encode(data).decode()
+
+    @staticmethod
+    def _extract_json(text: str) -> dict:
+        """Pull the first JSON object out of a model response."""
+        # try raw parse first
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            pass
+        # regex fallback
+        m = re.search(r"\{[\s\S]*\}", text)
+        if m:
+            try:
+                return json.loads(m.group())
+            except json.JSONDecodeError:
+                pass
+        return {}
+
+    # ── public helpers ───────────────────────────────────────
+
+    def check_connection(self) -> bool:
+        try:
+            r = self.client.get(f"{self.base_url}/api/tags")
+            return r.status_code == 200
+        except Exception:
+            return False
+
+    def list_models(self) -> list[str]:
+        try:
+            r = self.client.get(f"{self.base_url}/api/tags")
+            r.raise_for_status()
+            return [m["name"] for m in r.json().get("models", [])]
+        except Exception:
+            return []
+
+    # ── query understanding ──────────────────────────────────
+
+    def understand_query(self, query: str) -> dict:
+        prompt = f"""Analyze this product search query and extract structured information.
+
+Query: "{query}"
+
+Return JSON only:
+{{
+    "product_type": "main product category",
+    "brand": "brand name or empty string",
+    "model": "model number or empty string",
+    "key_features": ["list", "of", "important", "features"],
+    "specifications": {{"key": "value pairs for measurable specs"}},
+    "search_queries": ["primary search", "alternative search 1", "alternative search 2"],
+    "category_hint": "one of: tools, lumber, plumbing, electrical, paint, flooring, appliances, hardware, outdoor, bath, kitchen, lighting, storage, building_materials, other",
+    "pro_grade": false,
+    "project_type": "type of project this might be for, or empty string"
+}}"""
+        raw = self._generate(prompt)
+        result = self._extract_json(raw)
+
+        if not result.get("search_queries"):
+            result["search_queries"] = [query]
+        if not result.get("product_type"):
+            result["product_type"] = query
+        if not result.get("category_hint"):
+            result["category_hint"] = "other"
+
+        return result
+
+    def analyze_image(self, image_path: str) -> dict:
+        b64 = self._image_to_base64(image_path)
+        prompt = """Analyze this product image. Identify the product and extract details.
+
+Return JSON only:
+{
+    "product_type": "what the product is",
+    "brand": "visible brand or empty string",
+    "model": "model number if visible or empty string",
+    "color": "color or finish",
+    "material": "primary material if identifiable",
+    "key_features": ["visible", "features"],
+    "estimated_category": "one of: tools, lumber, plumbing, electrical, paint, flooring, appliances, hardware, outdoor, bath, kitchen, lighting, storage, building_materials, other",
+    "search_queries": ["best search query", "alternative search"],
+    "condition": "new or used",
+    "pro_grade": false,
+    "description": "short description of the product"
+}"""
+        raw = self._generate(prompt, model=self.vision_model, images=[b64])
+        result = self._extract_json(raw)
+
+        if not result.get("search_queries"):
+            result["search_queries"] = [result.get("product_type", "product")]
+
+        return result
+
+    # ── product verification ─────────────────────────────────
+
+    def verify_product_match(
+        self,
+        query_info: dict,
+        product: dict,
+    ) -> dict:
+        prompt = f"""Compare the SEARCHED product to the FOUND product and assess match quality.
+
+SEARCHED:
+- Product type: {query_info.get("product_type", "unknown")}
+- Brand: {query_info.get("brand", "any")}
+- Model: {query_info.get("model", "any")}
+- Key features: {query_info.get("key_features", [])}
+- Specifications: {query_info.get("specifications", {{}})}
+- Category hint: {query_info.get("category_hint", "other")}
+
+FOUND on Lowes.com:
+- Title: {product.get("title", "unknown")}
+- Brand: {product.get("brand", "unknown")}
+- Model: {product.get("model_number", "unknown")}
+- Price: ${product.get("price", "unknown")}
+- Rating: {product.get("rating", "N/A")} ({product.get("review_count", 0)} reviews)
+- Category: {product.get("category", "unknown")}
+- Item #: {product.get("item_number", "unknown")}
+
+Return JSON only:
+{{
+    "confidence": <0-100>,
+    "is_match": <true/false>,
+    "match_type": "exact|close|partial|different",
+    "brand_match": <true/false>,
+    "model_match": <true/false>,
+    "category_match": <true/false>,
+    "feature_overlap": <0-100>,
+    "concerns": ["list of concerns"],
+    "explanation": "brief explanation"
+}}"""
+        raw = self._generate(prompt)
+        result = self._extract_json(raw)
+
+        if "confidence" not in result:
+            result["confidence"] = 0
+            result["is_match"] = False
+            result["match_type"] = "unknown"
+
+        return result
+
+    # ── recommendation ───────────────────────────────────────
+
+    def generate_recommendation(
+        self,
+        query_info: dict,
+        top_products: list[dict],
+        deal_analyses: list[dict],
+    ) -> str:
+        product_summaries = []
+        for i, (p, d) in enumerate(zip(top_products, deal_analyses), 1):
+            product_summaries.append(
+                f"{i}. {p.get('title', 'Unknown')} - ${p.get('price', '?')}\n"
+                f"   Rating: {p.get('rating', 'N/A')}/5 ({p.get('review_count', 0)} reviews)\n"
+                f"   Brand: {p.get('brand', 'Unknown')}\n"
+                f"   Deal Score: {d.get('deal_score', 0)}/100\n"
+                f"   In-store: {'Yes' if p.get('in_store_available') else 'Unknown'}\n"
+                f"   Pro-grade: {'Yes' if p.get('pro_grade') else 'No'}"
+            )
+
+        prompt = f"""You are a home improvement expert. Recommend the best option.
+
+Customer searched for: {query_info.get("product_type", "product")}
+Brand preference: {query_info.get("brand", "none")}
+Project type: {query_info.get("project_type", "general")}
+Pro-grade needed: {query_info.get("pro_grade", False)}
+
+Top options found at Lowe's:
+{chr(10).join(product_summaries)}
+
+Give a concise recommendation (3-5 sentences). Mention:
+1. Your top pick and WHY
+2. Best value option if different
+3. Whether to buy now or wait for a sale
+4. Any relevant Lowe's programs (MyLowe's Rewards, military discount, bulk pricing)
+5. If this is a pro-grade tool, mention Craftsman / DEWALT / Kobalt warranty info if relevant"""
+
+        return self._generate(prompt, temperature=0.5)
+
+    # ── cross-compare helper ─────────────────────────────────
+
+    def generate_cross_comparison(
+        self,
+        query_info: dict,
+        lowes_products: list[dict],
+        homedepot_products: list[dict],
+    ) -> str:
+        def _summarize(products, store):
+            lines = []
+            for p in products[:3]:
+                lines.append(
+                    f"  - {p.get('title','?')} | ${p.get('price','?')} | "
+                    f"Rating: {p.get('rating','N/A')}/5 ({p.get('review_count',0)} reviews)"
+                )
+            return f"{store}:\n" + "\n".join(lines) if lines else f"{store}: no results"
+
+        prompt = f"""Compare these products from Lowe's and Home Depot for a customer searching for "{query_info.get('product_type', 'product')}".
+
+{_summarize(lowes_products, "Lowe's")}
+
+{_summarize(homedepot_products, "Home Depot")}
+
+Give a brief (3-4 sentences) comparison:
+1. Which store has the better price?
+2. Which store has better-reviewed products?
+3. Any exclusive brands to consider (Kobalt/Craftsman at Lowe's vs Ryobi/Husky at Home Depot)?
+4. Final recommendation on where to buy."""
+
+        return self._generate(prompt, temperature=0.5)
+
+    def close(self):
+        self.client.close()
+```
+
+---
+
+## 5. `lowes_scraper.py`
+
+```python
+"""
+Lowe's product scraper – supports both static (requests+BS4) and
+dynamic (Playwright) page fetching, plus structured JSON-LD / Next.js
+data extraction.
+"""
+
+import json
+import re
+import time
+import random
+from typing import Optional
+from urllib.parse import quote_plus, urljoin
+
+import requests
+from bs4 import BeautifulSoup
+from fake_useragent import UserAgent
+
+from config import Config
+
+
+class LowesProduct:
+    """Normalized Lowe's product record."""
+
+    def __init__(self, data: dict):
+        self.item_number = data.get("item_number", "")
+        self.model_number = data.get("model_number", "")
+        self.title = data.get("title", "")
+        self.brand = data.get("brand", "")
+        self.price = data.get("price")
+        self.was_price = data.get("was_price")
+        self.unit_price = data.get("unit_price", "")
+        self.rating = data.get("rating")
+        self.review_count = data.get("review_count", 0)
+        self.url = data.get("url", "")
+        self.image_url = data.get("image_url", "")
+        self.category = data.get("category", "")
+        self.in_store_available = data.get("in_store_available")
+        self.shipping_available = data.get("shipping_available")
+        self.free_shipping = data.get("free_shipping", False)
+        self.pickup_available = data.get("pickup_available")
+        self.on_sale = data.get("on_sale", False)
+        self.badge = data.get("badge", "")          # "New Lower Price", "Top Rated", etc.
+        self.pro_grade = data.get("pro_grade", False)
+        self.bulk_pricing = data.get("bulk_pricing")
+        self.rebate = data.get("rebate", "")
+        self.savings = data.get("savings")
+        self.savings_pct = data.get("savings_pct")
+        self.sponsored = data.get("sponsored", False)
+
+    def to_dict(self) -> dict:
+        return {k: v for k, v in self.__dict__.items() if v is not None}
+
+    def __repr__(self):
+        return f"<LowesProduct item={self.item_number} '{self.title[:50]}' ${self.price}>"
+
+
+class LowesScraper:
+    """Fetch and parse product listings from lowes.com."""
+
+    BASE_URL = "https://www.lowes.com"
+    SEARCH_URL = "https://www.lowes.com/search?searchTerm={query}&offset={offset}"
+
+    def __init__(self):
+        self.ua = UserAgent()
+        self.max_pages = Config.MAX_PAGES
+        self.max_results = Config.MAX_RESULTS
+        self.delay = Config.REQUEST_DELAY
+        self.use_browser = Config.USE_BROWSER
+        self.store_id = Config.LOWES_STORE_ID
+        self.zip_code = Config.LOWES_ZIP_CODE
+        self._browser = None
+        self._context = None
+        self._playwright = None
+
+    # ── browser lifecycle ────────────────────────────────────
+
+    async def _ensure_browser(self):
+        if self._browser is None:
+            from playwright.async_api import async_playwright
+
+            self._playwright = await async_playwright().start()
+            self._browser = await self._playwright.chromium.launch(headless=True)
+            self._context = await self._browser.new_context(
+                user_agent=self.ua.random,
+                viewport={"width": 1920, "height": 1080},
+                locale="en-US",
+            )
+            # set store / zip cookies when available
+            if self.zip_code:
+                await self._context.add_cookies(
+                    [
+                        {
+                            "name": "sn",
+                            "value": self.store_id or "1234",
+                            "domain": ".lowes.com",
+                            "path": "/",
+                        },
+                        {
+                            "name": "zipcode",
+                            "value": self.zip_code,
+                            "domain": ".lowes.com",
+                            "path": "/",
+                        },
+                    ]
+                )
+
+    async def close(self):
+        if self._browser:
+            await self._browser.close()
+        if self._playwright:
+            await self._playwright.stop()
+        self._browser = None
+        self._context = None
+        self._playwright = None
+
+    # ── headers for requests ─────────────────────────────────
+
+    def _headers(self) -> dict:
+        return {
+            "User-Agent": self.ua.random,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "DNT": "1",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+            "Cache-Control": "max-age=0",
+        }
+
+    # ── page fetch ───────────────────────────────────────────
+
+    def _fetch_static(self, url: str) -> str:
+        cookies = {}
+        if self.zip_code:
+            cookies["zipcode"] = self.zip_code
+        if self.store_id:
+            cookies["sn"] = self.store_id
+
+        resp = requests.get(url, headers=self._headers(), cookies=cookies, timeout=20)
+        resp.raise_for_status()
+        return resp.text
+
+    async def _fetch_browser(self, url: str) -> str:
+        await self._ensure_browser()
+        page = await self._context.new_page()
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+            # wait for product grid
+            try:
+                await page.wait_for_selector(
+                    '[data-selector="prd-card"], .plp-card, [class*="ProductCard"]',
+                    timeout=8_000,
+                )
+            except Exception:
+                pass
+            # scroll to trigger lazy-loaded cards
+            for _ in range(3):
+                await page.evaluate("window.scrollBy(0, 800)")
+                await page.wait_for_timeout(600)
+            return await page.content()
+        finally:
+            await page.close()
+
+    # ── search entry point ───────────────────────────────────
+
+    async def search(self, query: str) -> list[LowesProduct]:
+        all_products: list[LowesProduct] = []
+        seen_items: set[str] = set()
+        encoded = quote_plus(query)
+
+        for page_num in range(self.max_pages):
+            offset = page_num * 24  # Lowe's typically shows 24 per page
+            url = self.SEARCH_URL.format(query=encoded, offset=offset)
+
+            try:
+                if self.use_browser:
+                    html = await self._fetch_browser(url)
+                else:
+                    html = self._fetch_static(url)
+            except Exception as exc:
+                print(f"[scraper] page {page_num + 1} fetch failed: {exc}")
+                break
+
+            products = self._parse_search_page(html)
+            if not products:
+                break
+
+            for p in products:
+                key = p.item_number or p.title
+                if key and key not in seen_items:
+                    seen_items.add(key)
+                    all_products.append(p)
+
+            if len(all_products) >= self.max_results:
+                break
+
+            delay = self.delay + random.uniform(0.5, 2.5)
+            time.sleep(delay)
+
+        return all_products[: self.max_results]
+
+    # ── HTML parsing ─────────────────────────────────────────
+
+    def _parse_search_page(self, html: str) -> list[LowesProduct]:
+        # Try JSON-LD / embedded data first
+        products = self._extract_json_data(html)
+        if products:
+            return products
+
+        # Fall back to DOM scraping
+        return self._parse_dom(html)
+
+    def _extract_json_data(self, html: str) -> list[LowesProduct]:
+        """Pull product data from __NEXT_DATA__ or other embedded JSON."""
+        products: list[LowesProduct] = []
+        soup = BeautifulSoup(html, "lxml")
+
+        # Attempt 1: __NEXT_DATA__
+        script = soup.find("script", {"id": "__NEXT_DATA__"})
+        if script and script.string:
+            try:
+                data = json.loads(script.string)
+                items = self._dig_for_products(data)
+                for item in items:
+                    p = self._normalize_json_product(item)
+                    if p:
+                        products.append(p)
+                if products:
+                    return products
+            except json.JSONDecodeError:
+                pass
+
+        # Attempt 2: inline JSON blobs
+        for script in soup.find_all("script"):
+            if not script.string:
+                continue
+            for pattern in [
+                r'"productResults"\s*:\s*(\[[\s\S]*?\])\s*[,}]',
+                r'"products"\s*:\s*(\[[\s\S]*?\])\s*[,}]',
+                r'"searchResults"\s*:\s*(\[[\s\S]*?\])\s*[,}]',
+            ]:
+                m = re.search(pattern, script.string)
+                if m:
+                    try:
+                        items = json.loads(m.group(1))
+                        for item in items:
+                            p = self._normalize_json_product(item)
+                            if p:
+                                products.append(p)
+                        if products:
+                            return products
+                    except json.JSONDecodeError:
+                        continue
+
+        # Attempt 3: JSON-LD
+        for script in soup.find_all("script", {"type": "application/ld+json"}):
+            if not script.string:
+                continue
+            try:
+                ld = json.loads(script.string)
+                if isinstance(ld, list):
+                    for item in ld:
+                        p = self._normalize_jsonld_product(item)
+                        if p:
+                            products.append(p)
+                elif isinstance(ld, dict):
+                    p = self._normalize_jsonld_product(ld)
+                    if p:
+                        products.append(p)
+            except json.JSONDecodeError:
+                continue
+
+        return products
+
+    def _dig_for_products(self, obj, depth: int = 0) -> list:
+        """Recursively search nested JSON for product arrays."""
+        if depth > 12:
+            return []
+        if isinstance(obj, dict):
+            for key in ("productResults", "products", "searchResults", "items"):
+                if key in obj and isinstance(obj[key], list):
+                    return obj[key]
+            for v in obj.values():
+                result = self._dig_for_products(v, depth + 1)
+                if result:
+                    return result
+        elif isinstance(obj, list) and len(obj) > 0:
+            if isinstance(obj[0], dict) and any(
+                k in obj[0]
+                for k in ("productId", "itemNumber", "modelNumber", "productTitle")
+            ):
+                return obj
+            for item in obj:
+                result = self._dig_for_products(item, depth + 1)
+                if result:
+                    return result
+        return []
+
+    def _normalize_json_product(self, item: dict) -> Optional[LowesProduct]:
+        if not isinstance(item, dict):
+            return None
+
+        price = (
+            item.get("price")
+            or item.get("sellingPrice")
+            or item.get("currentPrice")
+            or item.get("priceAmount")
+        )
+        if isinstance(price, str):
+            price = self._parse_price(price)
+        if price is None:
+            # Try nested pricing
+            pricing = item.get("pricing") or item.get("price", {})
+            if isinstance(pricing, dict):
+                price = pricing.get("sellingPrice") or pricing.get("currentPrice")
+                if isinstance(price, str):
+                    price = self._parse_price(price)
+
+        was_price = item.get("wasPrice") or item.get("originalPrice")
+        if isinstance(was_price, str):
+            was_price = self._parse_price(was_price)
+
+        title = (
+            item.get("productTitle")
+            or item.get("title")
+            or item.get("description")
+            or item.get("name")
+            or ""
+        )
+
+        item_number = (
+            item.get("itemNumber")
+            or item.get("productId")
+            or item.get("omniItemId")
+            or ""
+        )
+
+        product_url = item.get("pdURL") or item.get("url") or item.get("pdpUrl") or ""
+        if product_url and not product_url.startswith("http"):
+            product_url = urljoin(self.BASE_URL, product_url)
+
+        image = item.get("imageUrl") or item.get("image") or ""
+        if isinstance(image, dict):
+            image = image.get("url", "")
+
+        rating_data = item.get("rating") or item.get("reviews") or {}
+        if isinstance(rating_data, dict):
+            rating = rating_data.get("averageRating") or rating_data.get("rating")
+            reviews = rating_data.get("totalReviews") or rating_data.get("count", 0)
+        else:
+            rating = item.get("averageRating") or item.get("starRating")
+            reviews = item.get("totalReviews") or item.get("reviewCount", 0)
+
+        # Availability
+        availability = item.get("availability") or item.get("fulfillment") or {}
+        in_store = None
+        shipping = None
+        pickup = None
+        if isinstance(availability, dict):
+            in_store = availability.get("inStore") or availability.get("availableInStore")
+            shipping = availability.get("shipping") or availability.get("deliveryAvailable")
+            pickup = availability.get("pickup") or availability.get("bopisAvailable")
+
+        # Sale / badge
+        badge = item.get("badge") or item.get("productBadge") or ""
+        if isinstance(badge, dict):
+            badge = badge.get("label", "")
+        on_sale = bool(was_price and price and was_price > price) or "sale" in badge.lower()
+
+        savings = None
+        savings_pct = None
+        if was_price and price and was_price > price:
+            savings = round(was_price - price, 2)
+            savings_pct = round((savings / was_price) * 100, 1)
+
+        return LowesProduct(
+            {
+                "item_number": str(item_number),
+                "model_number": str(item.get("modelNumber") or item.get("modelNo") or ""),
+                "title": title.strip(),
+                "brand": item.get("brand") or item.get("brandName") or "",
+                "price": price,
+                "was_price": was_price,
+                "unit_price": item.get("unitPrice") or "",
+                "rating": float(rating) if rating else None,
+                "review_count": int(reviews) if reviews else 0,
+                "url": product_url,
+                "image_url": image,
+                "category": item.get("category") or item.get("categoryName") or "",
+                "in_store_available": in_store,
+                "shipping_available": shipping,
+                "free_shipping": item.get("freeShipping", False),
+                "pickup_available": pickup,
+                "on_sale": on_sale,
+                "badge": badge,
+                "pro_grade": item.get("proGrade", False),
+                "bulk_pricing": item.get("bulkPricing"),
+                "rebate": item.get("rebate") or "",
+                "savings": savings,
+                "savings_pct": savings_pct,
+                "sponsored": item.get("sponsored", False),
+            }
+        )
+
+    def _normalize_jsonld_product(self, item: dict) -> Optional[LowesProduct]:
+        if item.get("@type") != "Product":
+            return None
+
+        offers = item.get("offers", {})
+        if isinstance(offers, list):
+            offers = offers[0] if offers else {}
+
+        price = offers.get("price")
+        if isinstance(price, str):
+            price = self._parse_price(price)
+
+        return LowesProduct(
+            {
+                "item_number": item.get("sku", ""),
+                "model_number": item.get("model", ""),
+                "title": item.get("name", ""),
+                "brand": item.get("brand", {}).get("name", "") if isinstance(item.get("brand"), dict) else str(item.get("brand", "")),
+                "price": price,
+                "url": item.get("url", ""),
+                "image_url": item.get("image", ""),
+                "rating": float(item["aggregateRating"]["ratingValue"]) if "aggregateRating" in item else None,
+                "review_count": int(item.get("aggregateRating", {}).get("reviewCount", 0)),
+            }
+        )
+
+    # ── DOM parsing fallback ─────────────────────────────────
+
+    def _parse_dom(self, html: str) -> list[LowesProduct]:
+        soup = BeautifulSoup(html, "lxml")
+        products: list[LowesProduct] = []
+
+        # Lowe's uses various card selectors
+        card_selectors = [
+            {"attrs": {"data-selector": "prd-card"}},
+            {"class_": re.compile(r"plp-card|ProductCard|product-card", re.I)},
+            {"attrs": {"data-testid": re.compile(r"product-card|search-result", re.I)}},
+        ]
+
+        cards = []
+        for sel in card_selectors:
+            cards = soup.find_all("div", **sel)
+            if not cards:
+                cards = soup.find_all("article", **sel)
+            if cards:
+                break
+
+        if not cards:
+            # broad fallback
+            cards = soup.find_all(
+                "div",
+                class_=re.compile(r"product|result|item", re.I),
+            )
+
+        for card in cards:
+            try:
+                p = self._parse_card(card)
+                if p and p.title:
+                    products.append(p)
+            except Exception:
+                continue
+
+        return products
+
+    def _parse_card(self, card) -> Optional[LowesProduct]:
+        data: dict = {}
+
+        # ── title ──
+        title_el = (
+            card.find("a", attrs={"data-selector": re.compile(r"prd-title|product-title", re.I)})
+            or card.find("h3")
+            or card.find("h2")
+            or card.find("a", class_=re.compile(r"title|product-name", re.I))
+            or card.find("span", class_=re.compile(r"title|product-name", re.I))
+        )
+        if title_el:
+            data["title"] = title_el.get_text(strip=True)
+            if title_el.name == "a" and title_el.get("href"):
+                href = title_el["href"]
+                data["url"] = href if href.startswith("http") else urljoin(self.BASE_URL, href)
+
+        # ── brand ──
+        brand_el = card.find(
+            ["span", "p", "div"],
+            class_=re.compile(r"brand|manufacturer", re.I),
+        ) or card.find(attrs={"data-selector": re.compile(r"brand", re.I)})
+        if brand_el:
+            data["brand"] = brand_el.get_text(strip=True)
+
+        # ── price ──
+        price_el = (
+            card.find(attrs={"data-selector": re.compile(r"price", re.I)})
+            or card.find("span", class_=re.compile(r"main-price|current-price|selling-price", re.I))
+            or card.find("div", class_=re.compile(r"price", re.I))
+        )
+        if price_el:
+            data["price"] = self._parse_price(price_el.get_text())
+
+        # Lowe's often splits dollars and cents
+        if data.get("price") is None:
+            dollar_el = card.find(
+                "span", class_=re.compile(r"dollar|price-dollar", re.I)
+            )
+            cent_el = card.find(
+                "span", class_=re.compile(r"cent|price-cent", re.I)
+            )
+            if dollar_el:
+                dollars = re.sub(r"[^\d]", "", dollar_el.get_text())
+                cents = "00"
+                if cent_el:
+                    cents = re.sub(r"[^\d]", "", cent_el.get_text())
+                try:
+                    data["price"] = float(f"{dollars}.{cents}")
+                except ValueError:
+                    pass
+
+        # ── was price ──
+        was_el = card.find(
+            ["span", "div"],
+            class_=re.compile(r"was-price|original-price|strike", re.I),
+        )
+        if was_el:
+            data["was_price"] = self._parse_price(was_el.get_text())
+
+        # ── rating ──
+        rating_el = card.find(
+            ["span", "div"],
+            class_=re.compile(r"rating|stars|review", re.I),
+        ) or card.find(attrs={"aria-label": re.compile(r"star|rating", re.I)})
+        if rating_el:
+            label = rating_el.get("aria-label", "") or rating_el.get_text()
+            m = re.search(r"([\d.]+)\s*(?:out of|/)\s*5", label)
+            if m:
+                data["rating"] = float(m.group(1))
+            review_m = re.search(r"\(?([\d,]+)\)?\s*(?:review|rating)", label, re.I)
+            if review_m:
+                data["review_count"] = int(review_m.group(1).replace(",", ""))
+
+        # ── item / model number ──
+        model_el = card.find(
+            ["span", "div"],
+            class_=re.compile(r"model|item-number", re.I),
+        )
+        if model_el:
+            text = model_el.get_text(strip=True)
+            m_item = re.search(r"Item\s*#?\s*:?\s*(\d+)", text, re.I)
+            m_model = re.search(r"Model\s*#?\s*:?\s*([\w-]+)", text, re.I)
+            if m_item:
+                data["item_number"] = m_item.group(1)
+            if m_model:
+                data["model_number"] = m_model.group(1)
+
+        # ── image ──
+        img = card.find("img")
+        if img:
+            data["image_url"] = img.get("src") or img.get("data-src") or ""
+
+        # ── badges ──
+        badge_el = card.find(
+            ["span", "div"],
+            class_=re.compile(r"badge|tag|label|promo", re.I),
+        )
+        if badge_el:
+            data["badge"] = badge_el.get_text(strip=True)
+
+        # ── sale detection ──
+        if data.get("was_price") and data.get("price"):
+            if data["was_price"] > data["price"]:
+                data["on_sale"] = True
+                data["savings"] = round(data["was_price"] - data["price"], 2)
+                data["savings_pct"] = round(
+                    (data["savings"] / data["was_price"]) * 100, 1
+                )
+
+        # ── sponsored ──
+        if card.find(string=re.compile(r"sponsored", re.I)):
+            data["sponsored"] = True
+
+        if not data.get("title"):
+            return None
+
+        return LowesProduct(data)
+
+    # ── product detail page ──────────────────────────────────
+
+    async def get_product_details(self, url: str) -> Optional[dict]:
+        """Fetch a full product detail page for richer info."""
+        try:
+            if self.use_browser:
+                html = await self._fetch_browser(url)
+            else:
+                html = self._fetch_static(url)
+        except Exception:
+            return None
+
+        soup = BeautifulSoup(html, "lxml")
+        details: dict = {}
+
+        # JSON-LD
+        for script in soup.find_all("script", {"type": "application/ld+json"}):
+            if not script.string:
+                continue
+            try:
+                ld = json.loads(script.string)
+                if isinstance(ld, dict) and ld.get("@type") == "Product":
+                    details["title"] = ld.get("name")
+                    details["brand"] = (
+                        ld.get("brand", {}).get("name")
+                        if isinstance(ld.get("brand"), dict)
+                        else ld.get("brand")
+                    )
+                    details["description"] = ld.get("description")
+                    details["sku"] = ld.get("sku")
+                    details["model"] = ld.get("model")
+                    offers = ld.get("offers", {})
+                    if isinstance(offers, list):
+                        offers = offers[0] if offers else {}
+                    details["price"] = offers.get("price")
+                    details["availability"] = offers.get("availability", "")
+                    agg = ld.get("aggregateRating", {})
+                    details["rating"] = agg.get("ratingValue")
+                    details["review_count"] = agg.get("reviewCount")
+            except json.JSONDecodeError:
+                continue
+
+        # Specifications table
+        spec_section = soup.find(
+            "div",
+            class_=re.compile(r"specifications|spec-table|product-specs", re.I),
+        )
+        if spec_section:
+            specs = {}
+            rows = spec_section.find_all("tr") or spec_section.find_all(
+                "div", class_=re.compile(r"spec-row|attribute", re.I)
+            )
+            for row in rows:
+                cells = row.find_all(["th", "td", "span", "div"])
+                if len(cells) >= 2:
+                    key = cells[0].get_text(strip=True)
+                    val = cells[1].get_text(strip=True)
+                    if key:
+                        specs[key] = val
+            details["specifications"] = specs
+
+        return details
+
+    # ── helpers ───────────────────────────────────────────────
+
+    @staticmethod
+    def _parse_price(text: str) -> Optional[float]:
+        if not text:
+            return None
+        text = text.replace(",", "").replace("$", "").strip()
+        m = re.search(r"(\d+\.?\d*)", text)
+        if m:
+            try:
+                return float(m.group(1))
+            except ValueError:
+                return None
+        return None
+```
+
+---
+
+## 6. `product_verifier.py`
+
+```python
+"""
+Product verifier – uses the AI engine to confirm that scraped
+results genuinely match the user's query.
+"""
+
+from dataclasses import dataclass, field
+
+from ai_engine import AIEngine
+from lowes_scraper import LowesProduct
+from config import Config
+
+
+@dataclass
+class VerificationResult:
+    product: LowesProduct
+    confidence: int = 0
+    is_match: bool = False
+    match_type: str = "unknown"  # exact | close | partial | different
+    brand_match: bool = False
+    model_match: bool = False
+    category_match: bool = False
+    feature_overlap: int = 0
+    concerns: list = field(default_factory=list)
+    explanation: str = ""
+
+
+class ProductVerifier:
+    """Filter scraped products through AI-based matching."""
+
+    def __init__(self, ai: AIEngine):
+        self.ai = ai
+        self.threshold = Config.get_confidence_threshold()
+        self.mode = Config.VERIFICATION_MODE
+
+    def verify_batch(
+        self,
+        query_info: dict,
+        products: list[LowesProduct],
+    ) -> list[VerificationResult]:
+        results: list[VerificationResult] = []
+
+        for product in products:
+            vr = self._verify_one(query_info, product)
+            results.append(vr)
+
+        # Sort by confidence descending
+        results.sort(key=lambda r: r.confidence, reverse=True)
+        return results
+
+    def get_verified(
+        self,
+        query_info: dict,
+        products: list[LowesProduct],
+    ) -> list[VerificationResult]:
+        """Return only products that meet the confidence threshold."""
+        all_results = self.verify_batch(query_info, products)
+        return [r for r in all_results if r.is_match and r.confidence >= self.threshold]
+
+    def _verify_one(
+        self,
+        query_info: dict,
+        product: LowesProduct,
+    ) -> VerificationResult:
+        vr = VerificationResult(product=product)
+
+        # Quick pre-filters before calling the AI
+        if product.sponsored and self.mode == "strict":
+            vr.concerns.append("Sponsored listing (strict mode)")
+
+        ai_result = self.ai.verify_product_match(query_info, product.to_dict())
+
+        vr.confidence = ai_result.get("confidence", 0)
+        vr.is_match = ai_result.get("is_match", False)
+        vr.match_type = ai_result.get("match_type", "unknown")
+        vr.brand_match = ai_result.get("brand_match", False)
+        vr.model_match = ai_result.get("model_match", False)
+        vr.category_match = ai_result.get("category_match", False)
+        vr.feature_overlap = ai_result.get("feature_overlap", 0)
+        vr.concerns.extend(ai_result.get("concerns", []))
+        vr.explanation = ai_result.get("explanation", "")
+
+        # Mode adjustments
+        if self.mode == "strict":
+            if not vr.category_match:
+                vr.confidence = min(vr.confidence, 50)
+                vr.is_match = False
+            if query_info.get("brand") and not vr.brand_match:
+                vr.confidence = min(vr.confidence, 55)
+        elif self.mode == "loose":
+            if vr.confidence >= 45:
+                vr.is_match = True
+
+        return vr
+```
+
+---
+
+## 7. `deal_analyzer.py`
+
+```python
+"""
+Deal analyzer – scores deals with Lowe's-specific logic
+(military discount, MyLowe's Rewards, rebates, bulk pricing,
+pro program, price matching, etc.).
+"""
+
+from dataclasses import dataclass, field
+from typing import Optional
+
+from lowes_scraper import LowesProduct
+from price_history import PriceHistory
+
+
+@dataclass
+class DealAnalysis:
+    product: LowesProduct
+    deal_score: int = 0                    # 0-100
+    value_rating: str = "unknown"          # excellent / great / good / fair / poor
+    price_trend: str = "unknown"           # falling / stable / rising / new
+    is_all_time_low: bool = False
+    is_near_all_time_low: bool = False
+    price_drop_pct: Optional[float] = None
+    savings_from_was: Optional[float] = None
+    has_rebate: bool = False
+    rebate_info: str = ""
+    has_bulk_pricing: bool = False
+    bulk_info: str = ""
+    military_discount_eligible: bool = True  # most items
+    mylowes_benefit: str = ""
+    pro_program_eligible: bool = False
+    price_match_note: str = ""
+    free_shipping: bool = False
+    buy_recommendation: str = ""
+    deal_flags: list = field(default_factory=list)
+    reasons: list = field(default_factory=list)
+
+
+class DealAnalyzer:
+    """Score and characterize deals for Lowe's products."""
+
+    # ── Lowe's-specific constants ────────────────────────────
+    MILITARY_DISCOUNT_PCT = 10.0          # standard Lowe's military discount
+    MYLOWES_POINTS_PER_DOLLAR = 1         # MyLowe's Rewards points
+    PRO_VOLUME_DISCOUNT_THRESHOLD = 1500  # $ spend for pro pricing tiers
+
+    def __init__(self, price_history: Optional[PriceHistory] = None):
+        self.price_history = price_history
+
+    # ── public API ───────────────────────────────────────────
+
+    def analyze(self, product: LowesProduct) -> DealAnalysis:
+        da = DealAnalysis(product=product)
+        score_parts: list[int] = []
+
+        self._check_sale(product, da, score_parts)
+        self._check_rebate(product, da, score_parts)
+        self._check_bulk(product, da, score_parts)
+        self._check_shipping(product, da, score_parts)
+        self._check_ratings(product, da, score_parts)
+        self._check_badge(product, da, score_parts)
+        self._check_military(product, da, score_parts)
+        self._check_mylowes(product, da, score_parts)
+        self._check_pro(product, da, score_parts)
+        self._check_price_history(product, da, score_parts)
+        self._check_price_match(product, da, score_parts)
+
+        da.deal_score = min(100, max(0, int(sum(score_parts) / max(len(score_parts), 1))))
+        da.value_rating = self._score_to_rating(da.deal_score)
+        da.buy_recommendation = self._generate_recommendation(da)
+
+        return da
+
+    def analyze_batch(self, products: list[LowesProduct]) -> list[DealAnalysis]:
+        analyses = [self.analyze(p) for p in products]
+        analyses.sort(key=lambda a: a.deal_score, reverse=True)
+        return analyses
+
+    # ── individual checks ────────────────────────────────────
+
+    def _check_sale(self, p: LowesProduct, da: DealAnalysis, scores: list):
+        if p.on_sale and p.savings_pct:
+            da.savings_from_was = p.savings
+            da.price_drop_pct = p.savings_pct
+            da.deal_flags.append(f"🔻 {p.savings_pct}% off (save ${p.savings:.2f})")
+            da.reasons.append(f"On sale: was ${p.was_price:.2f}, now ${p.price:.2f}")
+
+            if p.savings_pct >= 40:
+                scores.append(95)
+            elif p.savings_pct >= 25:
+                scores.append(85)
+            elif p.savings_pct >= 15:
+                scores.append(75)
+            elif p.savings_pct >= 5:
+                scores.append(65)
+            else:
+                scores.append(55)
+        else:
+            scores.append(50)
+
+    def _check_rebate(self, p: LowesProduct, da: DealAnalysis, scores: list):
+        if p.rebate:
+            da.has_rebate = True
+            da.rebate_info = p.rebate
+            da.deal_flags.append(f"💰 Rebate: {p.rebate}")
+            da.reasons.append(f"Mail-in or instant rebate available")
+            scores.append(78)
+        else:
+            scores.append(50)
+
+    def _check_bulk(self, p: LowesProduct, da: DealAnalysis, scores: list):
+        if p.bulk_pricing:
+            da.has_bulk_pricing = True
+            da.bulk_info = str(p.bulk_pricing)
+            da.deal_flags.append("📦 Bulk pricing available")
+            da.reasons.append("Discounts available for larger quantities")
+            scores.append(72)
+        else:
+            scores.append(50)
+
+    def _check_shipping(self, p: LowesProduct, da: DealAnalysis, scores: list):
+        if p.free_shipping:
+            da.free_shipping = True
+            da.deal_flags.append("🚚 Free shipping")
+            da.reasons.append("Free shipping included")
+            scores.append(70)
+        elif p.shipping_available:
+            da.reasons.append("Shipping available (fee may apply)")
+            scores.append(55)
+        else:
+            scores.append(45)
+
+    def _check_ratings(self, p: LowesProduct, da: DealAnalysis, scores: list):
+        if p.rating and p.review_count:
+            if p.rating >= 4.5 and p.review_count >= 100:
+                da.deal_flags.append(f"⭐ Top Rated: {p.rating}/5 ({p.review_count:,} reviews)")
+                da.reasons.append("Highly rated with many reviews")
+                scores.append(85)
+            elif p.rating >= 4.0 and p.review_count >= 50:
+                da.reasons.append(f"Well reviewed: {p.rating}/5")
+                scores.append(70)
+            elif p.rating >= 3.5:
+                scores.append(55)
+            else:
+                da.reasons.append(f"Lower rating: {p.rating}/5")
+                scores.append(35)
+        else:
+            scores.append(50)
+
+    def _check_badge(self, p: LowesProduct, da: DealAnalysis, scores: list):
+        badge = (p.badge or "").lower()
+        if not badge:
+            scores.append(50)
+            return
+
+        badge_scores = {
+            "new lower price": (80, "🏷️ New Lower Price"),
+            "top rated": (78, "⭐ Top Rated"),
+            "best seller": (76, "🏆 Best Seller"),
+            "trending": (68, "📈 Trending"),
+            "clearance": (90, "🔥 Clearance"),
+            "special buy": (82, "💎 Special Buy"),
+            "buy more save more": (75, "📦 Buy More Save More"),
+            "new": (60, "🆕 New Product"),
+            "exclusive": (72, "🔒 Lowe's Exclusive"),
+        }
+
+        for keyword, (score, flag) in badge_scores.items():
+            if keyword in badge:
+                scores.append(score)
+                da.deal_flags.append(flag)
+                da.reasons.append(f"Badge: {p.badge}")
+                return
+
+        scores.append(55)
+
+    def _check_military(self, p: LowesProduct, da: DealAnalysis, scores: list):
+        """Lowe's offers a 10% military discount on most items."""
+        da.military_discount_eligible = True
+        if p.price:
+            discount = round(p.price * (self.MILITARY_DISCOUNT_PCT / 100), 2)
+            da.deal_flags.append(f"🎖️ Military discount: save ${discount:.2f} ({self.MILITARY_DISCOUNT_PCT}%)")
+            da.reasons.append(
+                f"Lowe's 10% military discount available (additional ${discount:.2f} off)"
+            )
+            # Small bonus since it stacks
+            scores.append(62)
+        else:
+            scores.append(50)
+
+    def _check_mylowes(self, p: LowesProduct, da: DealAnalysis, scores: list):
+        """MyLowe's Rewards program benefits."""
+        if p.price:
+            points = int(p.price * self.MYLOWES_POINTS_PER_DOLLAR)
+            da.mylowes_benefit = f"Earn ~{points} MyLowe's Money points"
+            # Every 1,000 points = $5
+            cash_back = round((points / 1000) * 5, 2)
+            if cash_back >= 0.01:
+                da.deal_flags.append(f"🎯 MyLowe's: earn ~${cash_back:.2f} back")
+                da.reasons.append(
+                    f"MyLowe's Rewards: ~{points} points (~${cash_back:.2f} back)"
+                )
+        scores.append(55)
+
+    def _check_pro(self, p: LowesProduct, da: DealAnalysis, scores: list):
+        """Lowe's Pro program benefits."""
+        if p.pro_grade:
+            da.pro_program_eligible = True
+            da.deal_flags.append("🔧 Lowe's Pro eligible")
+            da.reasons.append(
+                "Eligible for Lowe's Pro program (volume pricing, dedicated support)"
+            )
+            scores.append(68)
+        elif p.price and p.price >= 100:
+            # Larger purchases may benefit from pro pricing
+            da.reasons.append("Consider Lowe's Pro account for volume purchases")
+            scores.append(52)
+        else:
+            scores.append(50)
+
+    def _check_price_history(self, p: LowesProduct, da: DealAnalysis, scores: list):
+        if not self.price_history or not p.item_number:
+            da.price_trend = "new"
+            scores.append(50)
+            return
+
+        history = self.price_history.get_history(f"lowes_{p.item_number}")
+        if not history:
+            da.price_trend = "new"
+            scores.append(50)
+            return
+
+        prices = [h["price"] for h in history if h.get("price")]
+        if not prices:
+            scores.append(50)
+            return
+
+        all_time_low = min(prices)
+        all_time_high = max(prices)
+        current = p.price or 0
+
+        if current <= all_time_low:
+            da.is_all_time_low = True
+            da.price_trend = "falling"
+            da.deal_flags.append("📉 ALL-TIME LOW PRICE")
+            da.reasons.append(f"Current price is the lowest ever recorded")
+            scores.append(95)
+        elif all_time_low > 0 and current <= all_time_low * 1.05:
+            da.is_near_all_time_low = True
+            da.price_trend = "falling"
+            da.deal_flags.append("📉 Near all-time low")
+            da.reasons.append(f"Within 5% of all-time low (${all_time_low:.2f})")
+            scores.append(85)
+        elif len(prices) >= 3 and prices[-1] < prices[-2] < prices[-3]:
+            da.price_trend = "falling"
+            da.reasons.append("Price trending downward")
+            scores.append(72)
+        elif len(prices) >= 3 and prices[-1] > prices[-2] > prices[-3]:
+            da.price_trend = "rising"
+            da.reasons.append("Price trending upward – consider buying soon")
+            scores.append(40)
+        else:
+            da.price_trend = "stable"
+            scores.append(55)
+
+    def _check_price_match(self, p: LowesProduct, da: DealAnalysis, scores: list):
+        """Lowe's offers price matching on identical items."""
+        da.price_match_note = (
+            "Lowe's price matches identical in-stock items from local competitors "
+            "and select online retailers (homedepot.com, amazon.com, etc.)"
+        )
+        da.reasons.append("Price match guarantee available if found cheaper elsewhere")
+        scores.append(55)
+
+    # ── helpers ───────────────────────────────────────────────
+
+    @staticmethod
+    def _score_to_rating(score: int) -> str:
+        if score >= 85:
+            return "excellent"
+        if score >= 70:
+            return "great"
+        if score >= 55:
+            return "good"
+        if score >= 40:
+            return "fair"
+        return "poor"
+
+    @staticmethod
+    def _generate_recommendation(da: DealAnalysis) -> str:
+        reasons = []
+
+        if da.is_all_time_low:
+            reasons.append("🔥 BUY NOW – This is the all-time lowest price!")
+        elif da.is_near_all_time_low:
+            reasons.append("✅ Great time to buy – near the all-time low.")
+        elif da.savings_from_was and da.price_drop_pct and da.price_drop_pct >= 20:
+            reasons.append(f"✅ Good deal – {da.price_drop_pct}% off the original price.")
+        elif da.has_rebate:
+            reasons.append("✅ Rebate available – effective price is lower.")
+        elif da.price_trend == "rising":
+            reasons.append("⚠️ Price is rising – buy soon or wait for a sale event.")
+        elif da.deal_score >= 70:
+            reasons.append("✅ Solid deal at the current price.")
+        else:
+            reasons.append("⏳ Consider waiting for a Lowe's sale event (Memorial Day, Labor Day, Black Friday).")
+
+        if da.military_discount_eligible and da.product.price:
+            reasons.append(
+                f"💡 Military/veteran? Save an extra {DealAnalyzer.MILITARY_DISCOUNT_PCT}% "
+                f"(${da.product.price * 0.10:.2f})."
+            )
+
+        if da.has_bulk_pricing:
+            reasons.append("💡 Buying in bulk? Check for volume discounts.")
+
+        return " ".join(reasons)
+```
+
+---
+
+## 8. `price_history.py`
+
+```python
+"""
+SQLite-backed price history tracker for Lowe's products.
+"""
+
+import sqlite3
+import time
+from typing import Optional
+from config import Config
+
+
+class PriceHistory:
+    """Track product prices over time."""
+
+    def __init__(self, db_path: Optional[str] = None):
+        Config.ensure_dirs()
+        self.db_path = db_path or str(Config.DB_PATH)
+        self._init_db()
+
+    def _init_db(self):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS price_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    product_id TEXT NOT NULL,
+                    store TEXT NOT NULL DEFAULT 'lowes',
+                    title TEXT,
+                    brand TEXT,
+                    price REAL,
+                    was_price REAL,
+                    on_sale INTEGER DEFAULT 0,
+                    badge TEXT,
+                    url TEXT,
+                    timestamp REAL NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS search_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    query TEXT NOT NULL,
+                    result_count INTEGER DEFAULT 0,
+                    best_price REAL,
+                    timestamp REAL NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_ph_product
+                ON price_history(product_id, store)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_ph_timestamp
+                ON price_history(timestamp)
+                """
+            )
+
+    def record_price(
+        self,
+        product_id: str,
+        title: str = "",
+        brand: str = "",
+        price: Optional[float] = None,
+        was_price: Optional[float] = None,
+        on_sale: bool = False,
+        badge: str = "",
+        url: str = "",
+        store: str = "lowes",
+    ):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO price_history
+                    (product_id, store, title, brand, price, was_price, on_sale, badge, url, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    product_id,
+                    store,
+                    title,
+                    brand,
+                    price,
+                    was_price,
+                    1 if on_sale else 0,
+                    badge,
+                    url,
+                    time.time(),
+                ),
+            )
+
+    def record_search(
+        self,
+        query: str,
+        result_count: int = 0,
+        best_price: Optional[float] = None,
+    ):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO search_history (query, result_count, best_price, timestamp)
+                VALUES (?, ?, ?, ?)
+                """,
+                (query, result_count, best_price, time.time()),
+            )
+
+    def get_history(
+        self,
+        product_id: str,
+        store: str = "lowes",
+        limit: int = 100,
+    ) -> list[dict]:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT * FROM price_history
+                WHERE product_id = ? AND store = ?
+                ORDER BY timestamp DESC
+                LIMIT ?
+                """,
+                (product_id, store, limit),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_all_time_low(self, product_id: str, store: str = "lowes") -> Optional[float]:
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                """
+                SELECT MIN(price) as min_price FROM price_history
+                WHERE product_id = ? AND store = ? AND price IS NOT NULL
+                """,
+                (product_id, store),
+            ).fetchone()
+        return row[0] if row else None
+
+    def get_all_time_high(self, product_id: str, store: str = "lowes") -> Optional[float]:
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                """
+                SELECT MAX(price) as max_price FROM price_history
+                WHERE product_id = ? AND store = ? AND price IS NOT NULL
+                """,
+                (product_id, store),
+            ).fetchone()
+        return row[0] if row else None
+
+    def get_price_alerts(self, threshold_pct: float = 5.0) -> list[dict]:
+        """Find products whose current price dropped ≥ threshold_pct from the last recorded price."""
+        alerts = []
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            products = conn.execute(
+                "SELECT DISTINCT product_id, store FROM price_history"
+            ).fetchall()
+
+            for prod in products:
+                rows = conn.execute(
+                    """
+                    SELECT price, timestamp FROM price_history
+                    WHERE product_id = ? AND store = ? AND price IS NOT NULL
+                    ORDER BY timestamp DESC
+                    LIMIT 2
+                    """,
+                    (prod["product_id"], prod["store"]),
+                ).fetchall()
+
+                if len(rows) >= 2:
+                    current = rows[0]["price"]
+                    previous = rows[1]["price"]
+                    if previous and previous > 0:
+                        change_pct = ((previous - current) / previous) * 100
+                        if change_pct >= threshold_pct:
+                            alerts.append(
+                                {
+                                    "product_id": prod["product_id"],
+                                    "store": prod["store"],
+                                    "current_price": current,
+                                    "previous_price": previous,
+                                    "drop_pct": round(change_pct, 1),
+                                }
+                            )
+        return alerts
+```
+
+---
+
+## 9. `cross_compare.py`
+
+```python
+"""
+Cross-comparison module – searches Home Depot for the same products
+found on Lowe's and provides a side-by-side comparison.
+"""
+
+import asyncio
+import time
+import random
+import re
+from typing import Optional
+from urllib.parse import quote_plus
+
+import requests
+from bs4 import BeautifulSoup
+from fake_useragent import UserAgent
+
+from config import Config
+
+
+class HomeDepotResult:
+    """Minimal product data from Home Depot for comparison."""
+
+    def __init__(self, data: dict):
+        self.title = data.get("title", "")
+        self.brand = data.get("brand", "")
+        self.price = data.get("price")
+        self.was_price = data.get("was_price")
+        self.rating = data.get("rating")
+        self.review_count = data.get("review_count", 0)
+        self.url = data.get("url", "")
+        self.model_number = data.get("model_number", "")
+        self.on_sale = data.get("on_sale", False)
+        self.savings = data.get("savings")
+
+    def to_dict(self) -> dict:
+        return {k: v for k, v in self.__dict__.items() if v is not None}
+
+
+class CrossComparer:
+    """Search Home Depot for comparable products."""
+
+    HD_SEARCH_URL = "https://www.homedepot.com/s/{query}?NCNI-5"
+    HD_BASE = "https://www.homedepot.com"
+
+    def __init__(self):
+        self.ua = UserAgent()
+        self.enabled = Config.ENABLE_CROSS_COMPARE
+        self.sources = Config.CROSS_COMPARE_SOURCES
+
+    def _headers(self) -> dict:
+        return {
+            "User-Agent": self.ua.random,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "DNT": "1",
+            "Connection": "keep-alive",
+        }
+
+    # ── Home Depot search ────────────────────────────────────
+
+    def search_home_depot(self, query: str, max_results: int = 5) -> list[HomeDepotResult]:
+        if not self.enabled or "homedepot" not in self.sources:
+            return []
+
+        url = self.HD_SEARCH_URL.format(query=quote_plus(query))
+        try:
+            resp = requests.get(url, headers=self._headers(), timeout=15)
+            resp.raise_for_status()
+        except Exception as exc:
+            print(f"[cross-compare] Home Depot fetch failed: {exc}")
+            return []
+
+        return self._parse_hd_results(resp.text, max_results)
+
+    def _parse_hd_results(self, html: str, max_results: int) -> list[HomeDepotResult]:
+        soup = BeautifulSoup(html, "lxml")
+        results: list[HomeDepotResult] = []
+
+        # Try data-driven approach first
+        import json as _json
+
+        for script in soup.find_all("script"):
+            if not script.string:
+                continue
+            for pat in [
+                r'"products"\s*:\s*(\[[\s\S]*?\])\s*[,}]',
+                r'"searchResults"\s*:\s*(\[[\s\S]*?\])\s*[,}]',
+            ]:
+                m = re.search(pat, script.string)
+                if m:
+                    try:
+                        items = _json.loads(m.group(1))
+                        for item in items[:max_results]:
+                            r = self._normalize_hd_json(item)
+                            if r:
+                                results.append(r)
+                        if results:
+                            return results
+                    except _json.JSONDecodeError:
+                        continue
+
+        # DOM fallback
+        cards = soup.find_all(
+            "div",
+            class_=re.compile(r"product-pod|plp-pod|search-result", re.I),
+        )
+        for card in cards[:max_results]:
+            try:
+                data = {}
+                title_el = card.find(["h2", "h3", "a"], class_=re.compile(r"product-title|pod-title", re.I))
+                if title_el:
+                    data["title"] = title_el.get_text(strip=True)
+                    if title_el.get("href"):
+                        href = title_el["href"]
+                        data["url"] = href if href.startswith("http") else self.HD_BASE + href
+
+                price_el = card.find("span", class_=re.compile(r"price", re.I))
+                if price_el:
+                    m = re.search(r"(\d+\.?\d*)", price_el.get_text().replace(",", ""))
+                    if m:
+                        data["price"] = float(m.group(1))
+
+                brand_el = card.find("span", class_=re.compile(r"brand", re.I))
+                if brand_el:
+                    data["brand"] = brand_el.get_text(strip=True)
+
+                if data.get("title"):
+                    results.append(HomeDepotResult(data))
+            except Exception:
+                continue
+
+        return results
+
+    def _normalize_hd_json(self, item: dict) -> Optional[HomeDepotResult]:
+        if not isinstance(item, dict):
+            return None
+
+        price = item.get("price") or item.get("sellingPrice")
+        if isinstance(price, str):
+            m = re.search(r"(\d+\.?\d*)", price.replace(",", ""))
+            price = float(m.group(1)) if m else None
+
+        was_price = item.get("wasPrice") or item.get("originalPrice")
+        if isinstance(was_price, str):
+            m = re.search(r"(\d+\.?\d*)", was_price.replace(",", ""))
+            was_price = float(m.group(1)) if m else None
+
+        title = item.get("title") or item.get("productTitle") or item.get("name") or ""
+        if not title:
+            return None
+
+        url = item.get("url") or item.get("canonicalUrl") or ""
+        if url and not url.startswith("http"):
+            url = self.HD_BASE + url
+
+        savings = None
+        on_sale = False
+        if was_price and price and was_price > price:
+            savings = round(was_price - price, 2)
+            on_sale = True
+
+        return HomeDepotResult(
+            {
+                "title": title,
+                "brand": item.get("brand") or item.get("brandName") or "",
+                "price": price,
+                "was_price": was_price,
+                "rating": item.get("rating") or item.get("averageRating"),
+                "review_count": item.get("totalReviews") or item.get("reviewCount", 0),
+                "url": url,
+                "model_number": item.get("modelNumber") or "",
+                "on_sale": on_sale,
+                "savings": savings,
+            }
+        )
+
+    # ── comparison logic ─────────────────────────────────────
+
+    def compare(
+        self,
+        query: str,
+        lowes_products: list[dict],
+    ) -> dict:
+        """Run cross-comparison and return structured result."""
+        hd_results = self.search_home_depot(query)
+
+        lowes_best = None
+        hd_best = None
+
+        if lowes_products:
+            priced = [p for p in lowes_products if p.get("price")]
+            if priced:
+                lowes_best = min(priced, key=lambda p: p["price"])
+
+        if hd_results:
+            priced = [r for r in hd_results if r.price]
+            if priced:
+                hd_best = min(priced, key=lambda r: r.price)
+
+        winner = "tie"
+        savings = 0.0
+        if lowes_best and hd_best:
+            lp = lowes_best["price"]
+            hp = hd_best.price
+            if lp < hp:
+                winner = "lowes"
+                savings = round(hp - lp, 2)
+            elif hp < lp:
+                winner = "homedepot"
+                savings = round(lp - hp, 2)
+
+        return {
+            "lowes_best_price": lowes_best["price"] if lowes_best else None,
+            "lowes_best_title": lowes_best.get("title", "") if lowes_best else "",
+            "homedepot_best_price": hd_best.price if hd_best else None,
+            "homedepot_best_title": hd_best.title if hd_best else "",
+            "homedepot_results": [r.to_dict() for r in hd_results],
+            "winner": winner,
+            "savings": savings,
+            "lowes_price_match_eligible": winner == "homedepot" and savings > 0,
+        }
+```
+
+---
+
+## 10. `result_formatter.py`
+
+```python
+"""
+Rich-based CLI output for Lowe's Price Finder results.
+"""
+
+from rich.console import Console
+from rich.table import Table
+from rich.panel import Panel
+from rich.columns import Columns
+from rich.text import Text
+from rich import box
+
+from lowes_scraper import LowesProduct
+from deal_analyzer import DealAnalysis
+from product_verifier import VerificationResult
+
+console = Console()
+
+
+class ResultFormatter:
+    """Format and display search results."""
+
+    @staticmethod
+    def print_header(query: str, product_info: dict):
+        console.print()
+        console.print(
+            Panel(
+                f"[bold cyan]🔍 Searching Lowe's for:[/] [bold white]{query}[/]\n"
+                f"[dim]Category: {product_info.get('category_hint', 'general')} | "
+                f"Brand: {product_info.get('brand', 'any')} | "
+                f"Pro-grade: {'Yes' if product_info.get('pro_grade') else 'No'}[/]",
+                title="[bold blue]🏠 Lowe's AI Price Finder[/]",
+                border_style="blue",
+            )
+        )
+
+    @staticmethod
+    def print_results_table(
+        verified: list[VerificationResult],
+        analyses: list[DealAnalysis],
+    ):
+        # Map analyses by item number for lookup
+        analysis_map = {}
+        for a in analyses:
+            key = a.product.item_number or a.product.title
+            analysis_map[key] = a
+
+        table = Table(
+            title="🔎 Search Results",
+            box=box.ROUNDED,
+            show_lines=True,
+            title_style="bold cyan",
+        )
+        table.add_column("#", style="dim", width=3)
+        table.add_column("Product", style="white", max_width=45)
+        table.add_column("Price", style="green", justify="right", width=12)
+        table.add_column("Rating", justify="center", width=14)
+        table.add_column("Match", justify="center", width=8)
+        table.add_column("Deal", justify="center", width=8)
+        table.add_column("Flags", style="yellow", max_width=30)
+
+        for i, vr in enumerate(verified[:15], 1):
+            p = vr.product
+            key = p.item_number or p.title
+            da = analysis_map.get(key)
+
+            # Price column
+            if p.on_sale and p.was_price:
+                price_str = f"[bold green]${p.price:.2f}[/]\n[dim strikethrough]${p.was_price:.2f}[/]"
+            elif p.price:
+                price_str = f"${p.price:.2f}"
+            else:
+                price_str = "[dim]N/A[/]"
+
+            # Rating
+            if p.rating:
+                stars = "⭐" * int(p.rating)
+                rating_str = f"{stars}\n{p.rating}/5 ({p.review_count:,})"
+            else:
+                rating_str = "[dim]No reviews[/]"
+
+            # Match confidence
+            if vr.confidence >= 85:
+                match_str = f"[bold green]{vr.confidence}%[/]"
+            elif vr.confidence >= 70:
+                match_str = f"[yellow]{vr.confidence}%[/]"
+            else:
+                match_str = f"[red]{vr.confidence}%[/]"
+
+            # Deal score
+            deal_str = "[dim]—[/]"
+            if da:
+                if da.deal_score >= 80:
+                    deal_str = f"[bold green]{da.deal_score}[/]"
+                elif da.deal_score >= 60:
+                    deal_str = f"[yellow]{da.deal_score}[/]"
+                else:
+                    deal_str = f"[red]{da.deal_score}[/]"
+
+            # Flags
+            flags = []
+            if p.on_sale:
+                flags.append(f"🔻 {p.savings_pct}% off")
+            if p.free_shipping:
+                flags.append("🚚 Free ship")
+            if p.badge:
+                flags.append(f"🏷️ {p.badge[:15]}")
+            if p.rebate:
+                flags.append("💰 Rebate")
+            if da and da.is_all_time_low:
+                flags.append("📉 ATL!")
+
+            # Product info
+            brand = f"[bold]{p.brand}[/] " if p.brand else ""
+            title_short = p.title[:42] + "…" if len(p.title) > 42 else p.title
+            product_str = f"{brand}{title_short}"
+            if p.model_number:
+                product_str += f"\n[dim]Model: {p.model_number}[/]"
+            if p.item_number:
+                product_str += f" [dim]Item# {p.item_number}[/]"
+
+            table.add_row(
+                str(i),
+                product_str,
+                price_str,
+                rating_str,
+                match_str,
+                deal_str,
+                "\n".join(flags) if flags else "[dim]—[/]",
+            )
+
+        console.print(table)
+
+    @staticmethod
+    def print_best_price(verified: list[VerificationResult]):
+        priced = [vr for vr in verified if vr.product.price]
+        if not priced:
+            return
+
+        best = min(priced, key=lambda vr: vr.product.price)
+        p = best.product
+
+        content = (
+            f"[bold white]{p.title}[/]\n"
+            f"[bold green]💲 ${p.price:.2f}[/]"
+        )
+        if p.was_price and p.was_price > p.price:
+            content += f"  [dim strikethrough]${p.was_price:.2f}[/]  [bold red]Save ${p.savings:.2f}[/]"
+        content += f"\n[dim]Brand: {p.brand or 'N/A'} | Model: {p.model_number or 'N/A'}[/]"
+        if p.url:
+            content += f"\n[link={p.url}]{p.url}[/link]"
+
+        console.print(
+            Panel(content, title="[bold green]💰 Best Price Found[/]", border_style="green")
+        )
+
+    @staticmethod
+    def print_best_deal(analyses: list[DealAnalysis]):
+        if not analyses:
+            return
+
+        best = analyses[0]  # already sorted by deal_score
+        p = best.product
+
+        flags_str = " | ".join(best.deal_flags[:5]) if best.deal_flags else "No special flags"
+
+        content = (
+            f"[bold white]{p.title}[/]\n"
+            f"[bold green]💲 ${p.price:.2f}[/]  "
+            f"[bold cyan]Deal Score: {best.deal_score}/100 ({best.value_rating})[/]\n"
+            f"[yellow]{flags_str}[/]\n\n"
+            f"[italic]{best.buy_recommendation}[/]"
+        )
+
+        console.print(
+            Panel(content, title="[bold cyan]🏆 Best Deal[/]", border_style="cyan")
+        )
+
+    @staticmethod
+    def print_cross_comparison(comparison: dict):
+        if not comparison:
+            return
+
+        lowes_price = comparison.get("lowes_best_price")
+        hd_price = comparison.get("homedepot_best_price")
+        winner = comparison.get("winner", "tie")
+        savings = comparison.get("savings", 0)
+
+        lowes_str = f"${lowes_price:.2f}" if lowes_price else "N/A"
+        hd_str = f"${hd_price:.2f}" if hd_price else "N/A"
+
+        if winner == "lowes":
+            winner_str = f"[bold green]🏆 Lowe's wins by ${savings:.2f}![/]"
+        elif winner == "homedepot":
+            winner_str = (
+                f"[bold yellow]⚠️ Home Depot is ${savings:.2f} cheaper[/]\n"
+                f"[dim]💡 Lowe's price-matches! Show them the Home Depot price.[/]"
+            )
+        else:
+            winner_str = "[bold white]🤝 Prices are similar[/]"
+
+        table = Table(box=box.SIMPLE, show_header=True)
+        table.add_column("Store", style="bold")
+        table.add_column("Best Price", justify="right")
+        table.add_column("Product", max_width=40)
+
+        table.add_row(
+            "🔵 Lowe's",
+            f"[green]{lowes_str}[/]" if winner == "lowes" else lowes_str,
+            comparison.get("lowes_best_title", "")[:40],
+        )
+        table.add_row(
+            "🟠 Home Depot",
+            f"[green]{hd_str}[/]" if winner == "homedepot" else hd_str,
+            comparison.get("homedepot_best_title", "")[:40],
+        )
+
+        content = ""
+        console.print(
+            Panel(
+                table,
+                title="[bold magenta]⚖️ Lowe's vs Home Depot[/]",
+                subtitle=winner_str,
+                border_style="magenta",
+            )
+        )
+
+    @staticmethod
+    def print_recommendation(recommendation: str):
+        if recommendation:
+            console.print(
+                Panel(
+                    f"[italic]{recommendation}[/]",
+                    title="[bold yellow]🤖 AI Recommendation[/]",
+                    border_style="yellow",
+                )
+            )
+
+    @staticmethod
+    def print_deal_details(analysis: DealAnalysis):
+        p = analysis.product
+        rows = []
+
+        rows.append(f"[bold]Deal Score:[/] {analysis.deal_score}/100 ({analysis.value_rating})")
+        rows.append(f"[bold]Price Trend:[/] {analysis.price_trend}")
+
+        if analysis.savings_from_was:
+            rows.append(f"[bold]Savings:[/] ${analysis.savings_from_was:.2f} ({analysis.price_drop_pct:.1f}%)")
+        if analysis.has_rebate:
+            rows.append(f"[bold]Rebate:[/] {analysis.rebate_info}")
+        if analysis.has_bulk_pricing:
+            rows.append(f"[bold]Bulk Pricing:[/] {analysis.bulk_info}")
+        if analysis.military_discount_eligible and p.price:
+            discount = p.price * 0.10
+            rows.append(f"[bold]Military Discount:[/] Save ${discount:.2f} (10%)")
+        if analysis.mylowes_benefit:
+            rows.append(f"[bold]MyLowe's:[/] {analysis.mylowes_benefit}")
+        if analysis.pro_program_eligible:
+            rows.append(f"[bold]Pro Program:[/] Eligible for volume pricing")
+        rows.append(f"[bold]Price Match:[/] {analysis.price_match_note}")
+
+        if analysis.deal_flags:
+            rows.append("")
+            rows.append("[bold]Deal Flags:[/]")
+            for flag in analysis.deal_flags:
+                rows.append(f"  {flag}")
+
+        console.print(
+            Panel(
+                "\n".join(rows),
+                title=f"[bold]📊 Deal Analysis: {p.title[:50]}[/]",
+                border_style="blue",
+            )
+        )
+
+    @staticmethod
+    def print_error(message: str):
+        console.print(f"[bold red]❌ Error:[/] {message}")
+
+    @staticmethod
+    def print_status(message: str):
+        console.print(f"[bold blue]ℹ️[/] {message}")
+
+    @staticmethod
+    def print_success(message: str):
+        console.print(f"[bold green]✅[/] {message}")
+```
+
+---
+
+## 11. `main.py`
+
+```python
+#!/usr/bin/env python3
+"""
+AI-Powered Lowe's Price Finder
+Uses local Ollama models to find, verify, and analyze the best prices
+at Lowe's — with optional cross-comparison to Home Depot.
+"""
+
+import argparse
+import asyncio
+import sys
+from pathlib import Path
+
+from rich.console import Console
+from rich.progress import Progress, SpinnerColumn, TextColumn
+
+from config import Config
+from ai_engine import AIEngine
+from lowes_scraper import LowesScraper
+from product_verifier import ProductVerifier
+from deal_analyzer import DealAnalyzer
+from price_history import PriceHistory
+from cross_compare import CrossComparer
+from result_formatter import ResultFormatter
+
+console = Console()
+fmt = ResultFormatter()
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="🏠 AI-Powered Lowe's Price Finder",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python main.py "DeWalt 20V MAX drill"
+  python main.py "LVP flooring waterproof" --strict
+  python main.py --image photo_of_faucet.jpg
+  python main.py "Kobalt 24V mower" --no-cross-compare
+  python main.py "interior paint" --zip 90210
+  python main.py "DEWALT table saw" --detail 1
+        """,
+    )
+    parser.add_argument("query", nargs="?", help="Product search query")
+    parser.add_argument("--image", "-i", help="Path to product image")
+    parser.add_argument(
+        "--mode",
+        choices=["strict", "moderate", "loose"],
+        default=None,
+        help="Verification strictness (default: from .env)",
+    )
+    parser.add_argument("--strict", action="store_const", const="strict", dest="mode")
+    parser.add_argument("--loose", action="store_const", const="loose", dest="mode")
+    parser.add_argument("--max-results", type=int, default=None)
+    parser.add_argument("--max-pages", type=int, default=None)
+    parser.add_argument(
+        "--no-cross-compare",
+        action="store_true",
+        help="Disable Home Depot cross-comparison",
+    )
+    parser.add_argument("--zip", help="Override ZIP code for local pricing")
+    parser.add_argument("--store", help="Override Lowe's store ID")
+    parser.add_argument(
+        "--detail",
+        type=int,
+        metavar="N",
+        help="Show detailed deal analysis for result #N",
+    )
+    parser.add_argument(
+        "--no-ai",
+        action="store_true",
+        help="Skip AI verification (show raw results)",
+    )
+    parser.add_argument(
+        "--history",
+        action="store_true",
+        help="Show price history for matched products",
+    )
+    parser.add_argument(
+        "--alerts",
+        action="store_true",
+        help="Show recent price drop alerts",
+    )
+    return parser.parse_args()
+
+
+async def run_search(args):
+    Config.ensure_dirs()
+
+    # Apply overrides
+    if args.mode:
+        Config.VERIFICATION_MODE = args.mode
+    if args.max_results:
+        Config.MAX_RESULTS = args.max_results
+    if args.max_pages:
+        Config.MAX_PAGES = args.max_pages
+    if args.zip:
+        Config.LOWES_ZIP_CODE = args.zip
+    if args.store:
+        Config.LOWES_STORE_ID = args.store
+    if args.no_cross_compare:
+        Config.ENABLE_CROSS_COMPARE = False
+
+    ai = AIEngine()
+    scraper = LowesScraper()
+    price_history = PriceHistory() if Config.ENABLE_PRICE_HISTORY else None
+    deal_analyzer = DealAnalyzer(price_history=price_history)
+    cross_comparer = CrossComparer()
+
+    # ── Handle alerts-only mode ──────────────────────────────
+    if args.alerts:
+        if price_history:
+            alerts = price_history.get_price_alerts(Config.PRICE_DROP_ALERT_PCT)
+            if alerts:
+                console.print(f"\n[bold]📉 Price Drop Alerts (≥{Config.PRICE_DROP_ALERT_PCT}%):[/]\n")
+                for a in alerts:
+                    console.print(
+                        f"  • {a['product_id']}: ${a['previous_price']:.2f} → "
+                        f"${a['current_price']:.2f} ([bold green]-{a['drop_pct']}%[/])"
+                    )
+            else:
+                fmt.print_status("No recent price drops found.")
+        else:
+            fmt.print_error("Price history is disabled.")
+        return
+
+    # ── Check Ollama connection ──────────────────────────────
+    if not args.no_ai:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=console,
+        ) as progress:
+            task = progress.add_task("Connecting to Ollama...", total=None)
+            connected = ai.check_connection()
+            progress.remove_task(task)
+
+        if not connected:
+            fmt.print_error(
+                f"Cannot reach Ollama at {Config.OLLAMA_BASE_URL}.\n"
+                "   Make sure Ollama is running: ollama serve\n"
+                "   Or use --no-ai to skip AI verification."
+            )
+            return
+
+        models = ai.list_models()
+        if Config.OLLAMA_TEXT_MODEL not in models:
+            fmt.print_error(
+                f"Model '{Config.OLLAMA_TEXT_MODEL}' not found.\n"
+                f"   Available: {', '.join(models) or 'none'}\n"
+                f"   Pull it: ollama pull {Config.OLLAMA_TEXT_MODEL}"
+            )
+            return
+
+    # ── Determine query ──────────────────────────────────────
+    query = args.query or ""
+    query_info = {}
+
+    if args.image:
+        image_path = Path(args.image)
+        if not image_path.exists():
+            fmt.print_error(f"Image not found: {args.image}")
+            return
+
+        if
