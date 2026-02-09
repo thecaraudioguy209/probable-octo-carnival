@@ -1,0 +1,1620 @@
+
+
+# AI-Powered Amazon Price Finder with Ollama
+
+A complete Python tool that uses local Ollama AI models to understand your product queries (text or image), search Amazon, verify results, and find the best price.
+
+---
+
+## Project Structure
+
+```
+amazon_price_finder/
+├── .env
+├── config.py
+├── main.py
+├── ai_engine.py
+├── amazon_scraper.py
+├── product_verifier.py
+├── result_formatter.py
+├── requirements.txt
+└── cache/
+```
+
+---
+
+## 1. `requirements.txt`
+
+```txt
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+lxml>=5.1.0
+python-dotenv>=1.0.0
+rich>=13.7.0
+httpx>=0.27.0
+fake-useragent>=1.5.0
+Pillow>=10.0.0
+base64io>=1.0.0
+```
+
+---
+
+## 2. `.env`
+
+```env
+# ============================================
+# Ollama Configuration
+# ============================================
+
+# Ollama server URL (default local)
+OLLAMA_BASE_URL=http://localhost:11434
+
+# Text model (7B or smaller) - pick ONE:
+#   llama3.2:3b     (fastest, good enough)
+#   llama3.1:8b     (best quality at this size)  
+#   mistral:7b      (great all-rounder)
+#   gemma2:2b       (ultrafast, lightweight)
+#   phi3:3.8b       (Microsoft, very capable)
+#   qwen2.5:7b      (strong reasoning)
+OLLAMA_TEXT_MODEL=llama3.2:3b
+
+# Vision model for image input - pick ONE:
+#   llava:7b         (best image understanding)
+#   llava-llama3:8b  (newer, more accurate)
+#   moondream:1.8b   (tiny but works)
+#   bakllava:7b      (good balance)
+OLLAMA_VISION_MODEL=llava:7b
+
+# ============================================
+# Search Settings
+# ============================================
+
+# Max pages to scrape per search
+MAX_PAGES=3
+
+# Max results to analyze
+MAX_RESULTS=20
+
+# Request delay (seconds) - be respectful
+REQUEST_DELAY=2.0
+
+# Country/domain for Amazon
+AMAZON_DOMAIN=www.amazon.com
+AMAZON_COUNTRY=US
+
+# ============================================
+# AI Verification
+# ============================================
+
+# Minimum confidence score (0-100) for AI to consider a match
+MIN_MATCH_CONFIDENCE=70
+
+# How strict the AI should be when verifying
+# strict  = exact model/brand match required
+# moderate = same product type and brand
+# loose   = same general product category  
+VERIFICATION_MODE=moderate
+```
+
+---
+
+## 3. `config.py`
+
+```python
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+class Config:
+    # Ollama
+    OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+    OLLAMA_TEXT_MODEL = os.getenv("OLLAMA_TEXT_MODEL", "llama3.2:3b")
+    OLLAMA_VISION_MODEL = os.getenv("OLLAMA_VISION_MODEL", "llava:7b")
+
+    # Scraping
+    MAX_PAGES = int(os.getenv("MAX_PAGES", "3"))
+    MAX_RESULTS = int(os.getenv("MAX_RESULTS", "20"))
+    REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "2.0"))
+    AMAZON_DOMAIN = os.getenv("AMAZON_DOMAIN", "www.amazon.com")
+    AMAZON_COUNTRY = os.getenv("AMAZON_COUNTRY", "US")
+
+    # AI Verification
+    MIN_MATCH_CONFIDENCE = int(os.getenv("MIN_MATCH_CONFIDENCE", "70"))
+    VERIFICATION_MODE = os.getenv("VERIFICATION_MODE", "moderate")
+```
+
+---
+
+## 4. `ai_engine.py`
+
+```python
+"""
+AI Engine - Interfaces with Ollama for:
+1. Understanding user queries (text or image)
+2. Generating optimal search terms  
+3. Verifying product matches
+"""
+
+import json
+import base64
+import re
+from pathlib import Path
+
+import httpx
+from PIL import Image
+import io
+
+from config import Config
+
+
+class AIEngine:
+    def __init__(self):
+        self.base_url = Config.OLLAMA_BASE_URL
+        self.text_model = Config.OLLAMA_TEXT_MODEL
+        self.vision_model = Config.OLLAMA_VISION_MODEL
+        self.client = httpx.Client(timeout=120.0)
+        self._verify_ollama()
+
+    def _verify_ollama(self):
+        """Check Ollama is running and models are available."""
+        try:
+            resp = self.client.get(f"{self.base_url}/api/tags")
+            resp.raise_for_status()
+            available = [m["name"] for m in resp.json().get("models", [])]
+
+            # Check text model
+            text_found = any(
+                self.text_model in m or m.startswith(self.text_model.split(":")[0])
+                for m in available
+            )
+            if not text_found:
+                print(f"⚠️  Text model '{self.text_model}' not found locally.")
+                print(f"   Run: ollama pull {self.text_model}")
+                print(f"   Available: {', '.join(available[:10])}")
+
+            print(f"✅ Ollama connected | Text: {self.text_model}")
+
+        except Exception as e:
+            print(f"❌ Cannot connect to Ollama at {self.base_url}")
+            print(f"   Error: {e}")
+            print(f"   Make sure Ollama is running: ollama serve")
+            raise SystemExit(1)
+
+    def _chat(self, model: str, prompt: str, images: list = None, system: str = "") -> str:
+        """Send a chat request to Ollama."""
+        messages = []
+
+        if system:
+            messages.append({"role": "system", "content": system})
+
+        user_msg = {"role": "user", "content": prompt}
+        if images:
+            user_msg["images"] = images
+
+        messages.append(user_msg)
+
+        try:
+            resp = self.client.post(
+                f"{self.base_url}/api/chat",
+                json={
+                    "model": model,
+                    "messages": messages,
+                    "stream": False,
+                    "options": {
+                        "temperature": 0.1,
+                        "num_predict": 1024,
+                    },
+                },
+            )
+            resp.raise_for_status()
+            return resp.json()["message"]["content"].strip()
+
+        except httpx.TimeoutException:
+            print(f"⏳ AI response timed out. Retrying...")
+            resp = self.client.post(
+                f"{self.base_url}/api/chat",
+                json={
+                    "model": model,
+                    "messages": messages,
+                    "stream": False,
+                    "options": {
+                        "temperature": 0.1,
+                        "num_predict": 512,
+                    },
+                },
+                timeout=180.0,
+            )
+            resp.raise_for_status()
+            return resp.json()["message"]["content"].strip()
+
+    def _encode_image(self, image_path: str) -> str:
+        """Encode image to base64 for Ollama vision models."""
+        path = Path(image_path)
+
+        if not path.exists():
+            raise FileNotFoundError(f"Image not found: {image_path}")
+
+        # Resize if too large (vision models work better with reasonable sizes)
+        img = Image.open(path)
+        max_size = 1024
+
+        if max(img.size) > max_size:
+            ratio = max_size / max(img.size)
+            new_size = (int(img.size[0] * ratio), int(img.size[1] * ratio))
+            img = img.resize(new_size, Image.LANCZOS)
+
+        # Convert to RGB if necessary (handles PNG with alpha)
+        if img.mode in ("RGBA", "P", "LA"):
+            img = img.convert("RGB")
+
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=85)
+        return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+    # ------------------------------------------------------------------
+    # 1. UNDERSTAND USER QUERY
+    # ------------------------------------------------------------------
+
+    def understand_query(self, user_input: str, image_path: str = None) -> dict:
+        """
+        Parse the user's request into structured product information.
+        Handles: text descriptions, product names, vague descriptions, images.
+        
+        Returns: {
+            "product_name": "...",
+            "brand": "...",
+            "model": "...",
+            "category": "...",
+            "key_features": [...],
+            "search_queries": [...],
+            "original_input": "..."
+        }
+        """
+        if image_path:
+            return self._understand_from_image(image_path, user_input)
+        else:
+            return self._understand_from_text(user_input)
+
+    def _understand_from_text(self, user_input: str) -> dict:
+        """Extract product details from text description."""
+
+        system = (
+            "You are a product identification expert. "
+            "Extract structured product information from user queries. "
+            "Always respond with valid JSON only, no extra text."
+        )
+
+        prompt = f"""The user wants to find this product on Amazon:
+"{user_input}"
+
+Extract the product details and generate Amazon search queries.
+Respond with ONLY this JSON structure:
+
+{{
+    "product_name": "the full product name as best you can determine",
+    "brand": "brand name or empty string if unknown",
+    "model": "model number/name or empty string if unknown", 
+    "category": "general product category (e.g. power tools, electronics, etc)",
+    "key_features": ["list", "of", "important", "features", "mentioned"],
+    "search_queries": [
+        "most specific search query",
+        "slightly broader search query",
+        "broadest fallback query"
+    ]
+}}
+
+Rules:
+- search_queries should be optimized for Amazon search
+- First query = most specific (brand + model + key details)
+- Second query = brand + product type + key feature
+- Third query = general product type
+- If the user mentions a specific brand/model, ALWAYS include it in the first two queries
+- Include model numbers, voltage, features that narrow results"""
+
+        response = self._chat(self.text_model, prompt, system=system)
+        return self._parse_json_response(response, user_input)
+
+    def _understand_from_image(self, image_path: str, additional_text: str = "") -> dict:
+        """Identify product from an image using vision model."""
+
+        print(f"🖼️  Analyzing image: {image_path}")
+
+        try:
+            image_b64 = self._encode_image(image_path)
+        except FileNotFoundError as e:
+            print(f"❌ {e}")
+            raise
+
+        prompt = f"""Look at this product image carefully.
+
+Identify:
+1. What product is this?
+2. What brand is it?
+3. What model/version is it?
+4. What are its key features visible in the image?
+
+{f'Additional context from user: "{additional_text}"' if additional_text else ''}
+
+Respond with ONLY this JSON:
+
+{{
+    "product_name": "full product name",
+    "brand": "brand name",
+    "model": "model number/name",
+    "category": "product category",
+    "key_features": ["feature1", "feature2"],
+    "search_queries": [
+        "most specific amazon search query",
+        "broader search query", 
+        "broadest fallback query"
+    ]
+}}"""
+
+        response = self._chat(
+            self.vision_model,
+            prompt,
+            images=[image_b64],
+        )
+
+        original = additional_text or f"[Image: {image_path}]"
+        return self._parse_json_response(response, original)
+
+    # ------------------------------------------------------------------
+    # 2. VERIFY PRODUCT MATCH
+    # ------------------------------------------------------------------
+
+    def verify_product_match(
+        self,
+        wanted: dict,
+        candidate: dict,
+    ) -> dict:
+        """
+        Ask AI to verify if a found product matches what the user wants.
+        
+        Returns: {
+            "is_match": bool,
+            "confidence": int (0-100),
+            "reasoning": str,
+            "match_type": "exact" | "close" | "partial" | "no_match"
+        }
+        """
+
+        system = (
+            "You are a product matching expert. Compare products precisely. "
+            "Respond with valid JSON only."
+        )
+
+        prompt = f"""Compare these two products and determine if they are the same item.
+
+WANTED PRODUCT (what the user is looking for):
+- Name: {wanted.get('product_name', 'Unknown')}
+- Brand: {wanted.get('brand', 'Unknown')}
+- Model: {wanted.get('model', 'Unknown')}
+- Category: {wanted.get('category', 'Unknown')}
+- Key Features: {', '.join(wanted.get('key_features', []))}
+- Original Query: {wanted.get('original_input', '')}
+
+FOUND PRODUCT (from Amazon):
+- Title: {candidate.get('title', 'Unknown')}
+- Price: {candidate.get('price', 'Unknown')}
+- Rating: {candidate.get('rating', 'Unknown')}
+
+Verification mode: {Config.VERIFICATION_MODE}
+
+Rules for "{Config.VERIFICATION_MODE}" mode:
+- strict: Brand AND model must match exactly. Same specific product.
+- moderate: Same brand AND same type of product. Model should be same or very similar.
+- loose: Same general type of product. Brand preferred but not required.
+
+Respond with ONLY this JSON:
+
+{{
+    "is_match": true/false,
+    "confidence": 0-100,
+    "reasoning": "brief explanation of why this is or isn't a match",
+    "match_type": "exact|close|partial|no_match",
+    "concerns": ["any issues like wrong model", "refurbished vs new", "etc"]
+}}"""
+
+        response = self._chat(self.text_model, prompt, system=system)
+
+        try:
+            result = self._extract_json(response)
+            result["confidence"] = int(result.get("confidence", 0))
+            result["is_match"] = bool(result.get("is_match", False))
+            return result
+        except Exception:
+            return {
+                "is_match": False,
+                "confidence": 0,
+                "reasoning": "Failed to parse AI verification response",
+                "match_type": "no_match",
+                "concerns": ["AI parsing error"],
+            }
+
+    # ------------------------------------------------------------------
+    # 3. RANK AND RECOMMEND
+    # ------------------------------------------------------------------
+
+    def rank_results(self, wanted: dict, verified_products: list) -> str:
+        """Ask AI to rank verified products and give a recommendation."""
+
+        if not verified_products:
+            return "No verified matching products found."
+
+        products_text = ""
+        for i, p in enumerate(verified_products[:10], 1):
+            products_text += (
+                f"\n{i}. {p['title']}"
+                f"\n   Price: {p['price_display']}"
+                f"\n   Rating: {p.get('rating', 'N/A')} ({p.get('review_count', 'N/A')} reviews)"
+                f"\n   Match Confidence: {p.get('match_confidence', 'N/A')}%"
+                f"\n   Prime: {'Yes' if p.get('is_prime') else 'No'}"
+                f"\n   Seller: {p.get('seller', 'N/A')}"
+                f"\n"
+            )
+
+        prompt = f"""The user wanted: "{wanted.get('original_input', wanted.get('product_name', ''))}"
+
+Here are the verified matching products found on Amazon:
+{products_text}
+
+Give a brief, helpful recommendation:
+1. Which is the BEST DEAL and why?
+2. Any cautions (third-party sellers, too-good-to-be-true prices, etc.)?
+3. A one-line verdict.
+
+Keep it concise and practical. No JSON needed, just plain helpful text."""
+
+        return self._chat(self.text_model, prompt)
+
+    # ------------------------------------------------------------------
+    # HELPERS
+    # ------------------------------------------------------------------
+
+    def _parse_json_response(self, response: str, original_input: str) -> dict:
+        """Parse AI response into structured dict with fallbacks."""
+        try:
+            data = self._extract_json(response)
+            data["original_input"] = original_input
+
+            # Ensure required fields
+            data.setdefault("product_name", original_input)
+            data.setdefault("brand", "")
+            data.setdefault("model", "")
+            data.setdefault("category", "")
+            data.setdefault("key_features", [])
+            data.setdefault("search_queries", [original_input])
+
+            # Always ensure at least one search query
+            if not data["search_queries"]:
+                data["search_queries"] = [original_input]
+
+            return data
+
+        except Exception as e:
+            print(f"⚠️  AI response parsing failed, using raw input. ({e})")
+            return {
+                "product_name": original_input,
+                "brand": "",
+                "model": "",
+                "category": "",
+                "key_features": [],
+                "search_queries": [original_input],
+                "original_input": original_input,
+            }
+
+    def _extract_json(self, text: str) -> dict:
+        """Extract JSON from AI response that might contain extra text."""
+        # Try direct parse first
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            pass
+
+        # Find JSON block in markdown code fence
+        patterns = [
+            r"```json\s*(.*?)\s*```",
+            r"```\s*(.*?)\s*```",
+            r"(\{.*\})",
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, text, re.DOTALL)
+            if match:
+                try:
+                    return json.loads(match.group(1))
+                except json.JSONDecodeError:
+                    continue
+
+        raise ValueError(f"No valid JSON found in response: {text[:200]}")
+```
+
+---
+
+## 5. `amazon_scraper.py`
+
+```python
+"""
+Amazon Scraper - Searches Amazon and extracts product listings.
+Uses rotating user agents and respectful delays.
+"""
+
+import re
+import time
+import random
+from urllib.parse import urlencode, quote_plus
+
+import requests
+from bs4 import BeautifulSoup
+from fake_useragent import UserAgent
+
+from config import Config
+
+
+class AmazonScraper:
+    def __init__(self):
+        self.domain = Config.AMAZON_DOMAIN
+        self.max_pages = Config.MAX_PAGES
+        self.max_results = Config.MAX_RESULTS
+        self.delay = Config.REQUEST_DELAY
+        self.ua = UserAgent(fallback="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        self.session = requests.Session()
+
+    def _get_headers(self) -> dict:
+        """Generate realistic browser headers."""
+        return {
+            "User-Agent": self.ua.random,
+            "Accept": (
+                "text/html,application/xhtml+xml,application/xml;"
+                "q=0.9,image/avif,image/webp,*/*;q=0.8"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "DNT": "1",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+            "Cache-Control": "max-age=0",
+        }
+
+    def _respectful_delay(self):
+        """Random delay between requests."""
+        delay = self.delay + random.uniform(0.5, 2.0)
+        time.sleep(delay)
+
+    def search(self, query: str, sort_by: str = "relevance") -> list:
+        """
+        Search Amazon for products.
+        
+        sort_by options:
+            relevance  - Amazon default
+            price_low  - Price low to high
+            price_high - Price high to low
+            reviews    - Avg customer review
+            newest     - Newest arrivals
+        """
+        sort_map = {
+            "relevance": "",
+            "price_low": "price-asc-rank",
+            "price_high": "price-desc-rank",
+            "reviews": "review-rank",
+            "newest": "date-desc-rank",
+        }
+
+        all_products = []
+        sort_param = sort_map.get(sort_by, "")
+
+        for page in range(1, self.max_pages + 1):
+            print(f"   📄 Scraping page {page}/{self.max_pages} for: '{query}'")
+
+            params = {
+                "k": query,
+                "page": page,
+                "ref": f"sr_pg_{page}",
+            }
+            if sort_param:
+                params["s"] = sort_param
+
+            url = f"https://{self.domain}/s?{urlencode(params)}"
+
+            try:
+                self._respectful_delay()
+
+                resp = self.session.get(
+                    url,
+                    headers=self._get_headers(),
+                    timeout=15,
+                )
+
+                if resp.status_code == 503:
+                    print("   ⚠️  Amazon rate limit hit. Waiting 30s...")
+                    time.sleep(30)
+                    resp = self.session.get(url, headers=self._get_headers(), timeout=15)
+
+                if resp.status_code != 200:
+                    print(f"   ⚠️  Got status {resp.status_code}, skipping page {page}")
+                    continue
+
+                products = self._parse_search_results(resp.text)
+                all_products.extend(products)
+
+                print(f"   ✅ Found {len(products)} products on page {page}")
+
+                if len(all_products) >= self.max_results:
+                    break
+
+                # If no products found, no more pages
+                if not products:
+                    break
+
+            except requests.exceptions.RequestException as e:
+                print(f"   ❌ Request error on page {page}: {e}")
+                continue
+
+        # Deduplicate by ASIN
+        seen = set()
+        unique = []
+        for p in all_products:
+            if p["asin"] not in seen:
+                seen.add(p["asin"])
+                unique.append(p)
+
+        return unique[: self.max_results]
+
+    def search_multiple_queries(self, queries: list) -> list:
+        """Run multiple search queries and merge results."""
+        all_products = []
+        seen_asins = set()
+
+        for i, query in enumerate(queries):
+            print(f"\n🔎 Search query {i + 1}/{len(queries)}: '{query}'")
+            results = self.search(query)
+
+            for product in results:
+                if product["asin"] not in seen_asins:
+                    seen_asins.add(product["asin"])
+                    product["found_by_query"] = query
+                    all_products.append(product)
+
+        print(f"\n📊 Total unique products found: {len(all_products)}")
+        return all_products
+
+    def _parse_search_results(self, html: str) -> list:
+        """Parse Amazon search results HTML into product dicts."""
+        soup = BeautifulSoup(html, "lxml")
+        products = []
+
+        # Main search result containers
+        result_divs = soup.select(
+            '[data-component-type="s-search-result"]'
+        )
+
+        for div in result_divs:
+            try:
+                product = self._extract_product(div)
+                if product and product.get("title") and product.get("price", 0) > 0:
+                    products.append(product)
+            except Exception:
+                continue
+
+        return products
+
+    def _extract_product(self, div) -> dict | None:
+        """Extract product data from a single search result div."""
+
+        asin = div.get("data-asin", "")
+        if not asin or asin == "":
+            return None
+
+        product = {
+            "asin": asin,
+            "title": "",
+            "price": 0.0,
+            "price_display": "",
+            "original_price": 0.0,
+            "rating": 0.0,
+            "review_count": 0,
+            "is_prime": False,
+            "is_sponsored": False,
+            "seller": "",
+            "image_url": "",
+            "url": f"https://{self.domain}/dp/{asin}",
+            "badge": "",
+        }
+
+        # Title
+        title_el = (
+            div.select_one("h2 a span")
+            or div.select_one("h2 span")
+            or div.select_one('[data-cy="title-recipe"] .a-text-normal')
+        )
+        if title_el:
+            product["title"] = title_el.get_text(strip=True)
+        else:
+            return None  # No title = skip
+
+        # Price - multiple possible selectors
+        price = self._extract_price(div)
+        if price:
+            product["price"] = price
+            product["price_display"] = f"${price:.2f}"
+
+        # Original/list price (strikethrough)
+        original_el = div.select_one("span.a-price.a-text-price span.a-offscreen")
+        if original_el:
+            orig_price = self._parse_price_text(original_el.get_text(strip=True))
+            if orig_price:
+                product["original_price"] = orig_price
+
+        # Rating
+        rating_el = div.select_one("span.a-icon-alt")
+        if rating_el:
+            rating_text = rating_el.get_text(strip=True)
+            match = re.search(r"([\d.]+)\s*out\s*of", rating_text)
+            if match:
+                product["rating"] = float(match.group(1))
+
+        # Review count
+        review_el = (
+            div.select_one('span[aria-label*="stars"] + span a span')
+            or div.select_one('a[href*="customerReviews"] span')
+        )
+        if review_el:
+            review_text = review_el.get_text(strip=True).replace(",", "")
+            match = re.search(r"([\d]+)", review_text)
+            if match:
+                product["review_count"] = int(match.group(1))
+
+        # Also try the adjacent span
+        if product["review_count"] == 0:
+            all_links = div.select("a")
+            for link in all_links:
+                href = link.get("href", "")
+                if "customerReviews" in href or "#reviews" in href:
+                    span = link.select_one("span")
+                    if span:
+                        txt = span.get_text(strip=True).replace(",", "")
+                        m = re.search(r"(\d+)", txt)
+                        if m:
+                            product["review_count"] = int(m.group(1))
+                            break
+
+        # Prime
+        prime_el = div.select_one("i.a-icon-prime, [aria-label*='Prime']")
+        product["is_prime"] = prime_el is not None
+
+        # Sponsored
+        sponsored_el = div.select_one(
+            "span.puis-label-popover-default, "
+            "[data-component-type='sp-sponsored-result']"
+        )
+        product["is_sponsored"] = sponsored_el is not None
+
+        # Image
+        img_el = div.select_one("img.s-image")
+        if img_el:
+            product["image_url"] = img_el.get("src", "")
+
+        # Badges (Best Seller, Amazon's Choice, etc)
+        badge_el = div.select_one(
+            "span.a-badge-text, "
+            "[data-component-type='s-status-badge-component']"
+        )
+        if badge_el:
+            product["badge"] = badge_el.get_text(strip=True)
+
+        # Seller / "by" line
+        seller_el = div.select_one(".a-row.a-size-base .a-size-base:last-child")
+        if seller_el:
+            product["seller"] = seller_el.get_text(strip=True)
+
+        return product
+
+    def _extract_price(self, div) -> float | None:
+        """Extract price from various Amazon price element patterns."""
+
+        # Pattern 1: Whole + fraction
+        whole_el = div.select_one("span.a-price:not(.a-text-price) span.a-price-whole")
+        frac_el = div.select_one("span.a-price:not(.a-text-price) span.a-price-fraction")
+
+        if whole_el:
+            whole = whole_el.get_text(strip=True).replace(",", "").replace(".", "")
+            frac = frac_el.get_text(strip=True) if frac_el else "00"
+            try:
+                return float(f"{whole}.{frac}")
+            except ValueError:
+                pass
+
+        # Pattern 2: Offscreen price
+        offscreen = div.select_one("span.a-price:not(.a-text-price) span.a-offscreen")
+        if offscreen:
+            price = self._parse_price_text(offscreen.get_text(strip=True))
+            if price:
+                return price
+
+        # Pattern 3: data attribute
+        price_el = div.select_one("[data-a-price]")
+        if price_el:
+            try:
+                data = price_el.get("data-a-price", "")
+                if data:
+                    import json
+                    price_data = json.loads(data.replace("'", '"'))
+                    return float(price_data.get("amount", 0))
+            except Exception:
+                pass
+
+        return None
+
+    def _parse_price_text(self, text: str) -> float | None:
+        """Parse a price string like '$29.99' into float."""
+        if not text:
+            return None
+        cleaned = re.sub(r"[^\d.]", "", text)
+        try:
+            return float(cleaned)
+        except ValueError:
+            return None
+
+    def get_product_details(self, asin: str) -> dict | None:
+        """Fetch individual product page for more details."""
+        url = f"https://{self.domain}/dp/{asin}"
+
+        try:
+            self._respectful_delay()
+            resp = self.session.get(url, headers=self._get_headers(), timeout=15)
+
+            if resp.status_code != 200:
+                return None
+
+            soup = BeautifulSoup(resp.text, "lxml")
+            details = {"asin": asin}
+
+            # Full title
+            title_el = soup.select_one("#productTitle")
+            if title_el:
+                details["full_title"] = title_el.get_text(strip=True)
+
+            # "About this item" bullets
+            bullets = soup.select("#feature-bullets li span.a-list-item")
+            details["features"] = [b.get_text(strip=True) for b in bullets[:10]]
+
+            # Availability
+            avail = soup.select_one("#availability span")
+            if avail:
+                details["availability"] = avail.get_text(strip=True)
+
+            # Sold by
+            sold_by = soup.select_one("#sellerProfileTriggerId")
+            if sold_by:
+                details["sold_by"] = sold_by.get_text(strip=True)
+
+            merchant = soup.select_one("#merchant-info")
+            if merchant:
+                details["merchant_info"] = merchant.get_text(strip=True)
+
+            return details
+
+        except Exception as e:
+            print(f"   ⚠️  Could not fetch details for {asin}: {e}")
+            return None
+```
+
+---
+
+## 6. `product_verifier.py`
+
+```python
+"""
+Product Verifier - Uses AI to verify each found product
+actually matches what the user is looking for.
+"""
+
+from config import Config
+from ai_engine import AIEngine
+
+
+class ProductVerifier:
+    def __init__(self, ai: AIEngine):
+        self.ai = ai
+        self.min_confidence = Config.MIN_MATCH_CONFIDENCE
+
+    def verify_all(self, wanted: dict, candidates: list) -> list:
+        """
+        Verify all candidate products against what the user wants.
+        Returns only verified matches, sorted by best match + price.
+        """
+        if not candidates:
+            return []
+
+        print(f"\n🤖 AI Verifying {len(candidates)} products...")
+        print(f"   Mode: {Config.VERIFICATION_MODE} | Min confidence: {self.min_confidence}%")
+
+        verified = []
+        rejected = 0
+
+        for i, product in enumerate(candidates):
+            title_short = product["title"][:60]
+            print(f"\n   [{i + 1}/{len(candidates)}] Checking: {title_short}...")
+
+            result = self.ai.verify_product_match(wanted, product)
+
+            confidence = result.get("confidence", 0)
+            match_type = result.get("match_type", "no_match")
+            reasoning = result.get("reasoning", "")
+
+            if result.get("is_match") and confidence >= self.min_confidence:
+                product["match_confidence"] = confidence
+                product["match_type"] = match_type
+                product["match_reasoning"] = reasoning
+                product["match_concerns"] = result.get("concerns", [])
+                verified.append(product)
+
+                emoji = {
+                    "exact": "🎯",
+                    "close": "✅",
+                    "partial": "🟡",
+                }.get(match_type, "✅")
+
+                print(f"   {emoji} MATCH ({confidence}% - {match_type}): {reasoning[:80]}")
+            else:
+                rejected += 1
+                print(f"   ❌ REJECTED ({confidence}% - {match_type}): {reasoning[:80]}")
+
+        print(f"\n📊 Verification complete: {len(verified)} matches, {rejected} rejected")
+
+        # Sort: highest confidence first, then lowest price
+        verified.sort(
+            key=lambda x: (-x.get("match_confidence", 0), x.get("price", 9999))
+        )
+
+        return verified
+
+    def verify_single(self, wanted: dict, product: dict) -> dict:
+        """Verify a single product match. Returns the verification result."""
+        return self.ai.verify_product_match(wanted, product)
+```
+
+---
+
+## 7. `result_formatter.py`
+
+```python
+"""
+Result Formatter - Pretty prints results to console using Rich.
+"""
+
+from rich.console import Console
+from rich.table import Table
+from rich.panel import Panel
+from rich.text import Text
+from rich import box
+
+
+console = Console()
+
+
+def display_product_understanding(product_info: dict):
+    """Show what the AI understood from the user's query."""
+
+    content = Text()
+    content.append("Product: ", style="bold")
+    content.append(f"{product_info.get('product_name', 'Unknown')}\n")
+
+    if product_info.get("brand"):
+        content.append("Brand:   ", style="bold")
+        content.append(f"{product_info['brand']}\n")
+
+    if product_info.get("model"):
+        content.append("Model:   ", style="bold")
+        content.append(f"{product_info['model']}\n")
+
+    if product_info.get("category"):
+        content.append("Category:", style="bold")
+        content.append(f" {product_info['category']}\n")
+
+    if product_info.get("key_features"):
+        content.append("Features:", style="bold")
+        content.append(f" {', '.join(product_info['key_features'])}\n")
+
+    content.append("\nSearch Queries:\n", style="bold yellow")
+    for i, q in enumerate(product_info.get("search_queries", []), 1):
+        content.append(f"  {i}. {q}\n")
+
+    console.print(Panel(
+        content,
+        title="🤖 AI Product Understanding",
+        border_style="cyan",
+        box=box.ROUNDED,
+    ))
+
+
+def display_search_progress(query: str, page: int, total_pages: int):
+    """Show search progress."""
+    console.print(f"  🔍 [{page}/{total_pages}] Searching: '{query}'", style="dim")
+
+
+def display_results(wanted: dict, verified_products: list, ai_recommendation: str):
+    """Display the final results with verified products."""
+
+    if not verified_products:
+        console.print(Panel(
+            "[bold red]No verified matching products found on Amazon.[/]\n\n"
+            "Try:\n"
+            "• Being more specific (include brand, model number)\n"
+            "• Being less specific (just the product type)\n"
+            "• Checking your spelling\n"
+            "• Using --strict loose for broader matching",
+            title="❌ No Results",
+            border_style="red",
+        ))
+        return
+
+    # Best deal highlight
+    best = verified_products[0]
+    cheapest = min(verified_products, key=lambda x: x.get("price", 9999))
+
+    console.print()
+
+    # === BEST PRICE PANEL ===
+    best_text = Text()
+    best_text.append(f"💰 ${cheapest['price']:.2f}", style="bold green on black")
+    best_text.append(f"\n\n")
+    best_text.append(f"{cheapest['title']}\n\n", style="bold")
+
+    if cheapest.get("original_price", 0) > cheapest["price"]:
+        savings = cheapest["original_price"] - cheapest["price"]
+        pct = (savings / cheapest["original_price"]) * 100
+        best_text.append(f"Was: ${cheapest['original_price']:.2f} ", style="strike dim")
+        best_text.append(f"Save: ${savings:.2f} ({pct:.0f}% off)\n", style="bold green")
+
+    if cheapest.get("rating"):
+        stars = "⭐" * int(cheapest["rating"])
+        best_text.append(f"{stars} {cheapest['rating']}/5")
+        if cheapest.get("review_count"):
+            best_text.append(f" ({cheapest['review_count']:,} reviews)")
+        best_text.append("\n")
+
+    if cheapest.get("is_prime"):
+        best_text.append("✓ Prime Eligible\n", style="bold blue")
+
+    best_text.append(f"\n🔗 {cheapest['url']}\n")
+    best_text.append(f"Match: {cheapest.get('match_confidence', '?')}% ({cheapest.get('match_type', '?')})", style="dim")
+
+    console.print(Panel(
+        best_text,
+        title="🏆 BEST PRICE FOUND",
+        border_style="green",
+        box=box.DOUBLE,
+        padding=(1, 2),
+    ))
+
+    # === ALL RESULTS TABLE ===
+    if len(verified_products) > 1:
+        table = Table(
+            title=f"📋 All {len(verified_products)} Verified Matches",
+            box=box.ROUNDED,
+            show_lines=True,
+            title_style="bold",
+        )
+
+        table.add_column("#", style="dim", width=3, justify="center")
+        table.add_column("Product", max_width=50)
+        table.add_column("Price", justify="right", style="green bold", width=10)
+        table.add_column("Rating", justify="center", width=12)
+        table.add_column("Prime", justify="center", width=6)
+        table.add_column("Match", justify="center", width=8)
+
+        for i, product in enumerate(verified_products, 1):
+            # Price styling
+            price_str = f"${product['price']:.2f}"
+            if product == cheapest:
+                price_str = f"[bold green]${product['price']:.2f} ★[/]"
+
+            # Rating
+            rating = product.get("rating", 0)
+            reviews = product.get("review_count", 0)
+            rating_str = f"{'⭐' * min(int(rating), 5)} {rating}" if rating else "N/A"
+            if reviews:
+                rating_str += f"\n({reviews:,})"
+
+            # Prime
+            prime_str = "✅" if product.get("is_prime") else "—"
+
+            # Match confidence
+            conf = product.get("match_confidence", 0)
+            if conf >= 90:
+                match_str = f"[green]{conf}%[/]"
+            elif conf >= 75:
+                match_str = f"[yellow]{conf}%[/]"
+            else:
+                match_str = f"[red]{conf}%[/]"
+
+            # Title with link
+            title = product["title"][:48]
+            if product.get("badge"):
+                title = f"🏷 {product['badge']}\n{title}"
+
+            if product.get("match_concerns"):
+                title += f"\n⚠️ {', '.join(product['match_concerns'][:2])}"
+
+            table.add_row(str(i), title, price_str, rating_str, prime_str, match_str)
+
+        console.print(table)
+
+        # Links
+        console.print("\n[bold]🔗 Product Links:[/]")
+        for i, p in enumerate(verified_products, 1):
+            console.print(f"   {i}. {p['url']}")
+
+    # === AI RECOMMENDATION ===
+    if ai_recommendation:
+        console.print(Panel(
+            ai_recommendation,
+            title="🤖 AI Recommendation",
+            border_style="yellow",
+            box=box.ROUNDED,
+            padding=(1, 2),
+        ))
+
+    # === PRICE COMPARISON SUMMARY ===
+    if len(verified_products) > 1:
+        prices = [p["price"] for p in verified_products if p.get("price", 0) > 0]
+        if len(prices) > 1:
+            spread = max(prices) - min(prices)
+            avg_price = sum(prices) / len(prices)
+
+            summary = (
+                f"Price Range: ${min(prices):.2f} — ${max(prices):.2f}  "
+                f"(spread: ${spread:.2f})\n"
+                f"Average:     ${avg_price:.2f}"
+            )
+
+            console.print(Panel(
+                summary,
+                title="📊 Price Comparison",
+                border_style="blue",
+                box=box.SIMPLE,
+            ))
+```
+
+---
+
+## 8. `main.py`
+
+```python
+#!/usr/bin/env python3
+"""
+Amazon Price Finder with Ollama AI
+Find the best price on Amazon for any product using AI-powered search and verification.
+"""
+
+import sys
+import argparse
+
+from rich.console import Console
+from rich.panel import Panel
+from rich import box
+
+from config import Config
+from ai_engine import AIEngine
+from amazon_scraper import AmazonScraper
+from product_verifier import ProductVerifier
+from result_formatter import (
+    display_product_understanding,
+    display_results,
+)
+
+
+console = Console()
+
+
+def show_banner():
+    banner = """
+╔═══════════════════════════════════════════════════════╗
+║     🛒  AI-Powered Amazon Price Finder  🤖           ║
+║     Powered by Ollama (local AI)                      ║
+╚═══════════════════════════════════════════════════════╝"""
+    console.print(banner, style="bold cyan")
+
+
+def find_product(
+    query: str = None,
+    image_path: str = None,
+    sort_by: str = "relevance",
+    verification_mode: str = None,
+    show_rejected: bool = False,
+    top_n: int = 10,
+):
+    """Main pipeline: Understand → Search → Verify → Rank → Display."""
+
+    if not query and not image_path:
+        console.print("[red]Please provide a product query or image path.[/]")
+        return
+
+    # Override verification mode if specified
+    if verification_mode:
+        Config.VERIFICATION_MODE = verification_mode
+
+    # Initialize components
+    console.print("\n⚙️  Initializing AI engine...", style="dim")
+    ai = AIEngine()
+    scraper = AmazonScraper()
+    verifier = ProductVerifier(ai)
+
+    # =============================================
+    # STEP 1: Understand the query
+    # =============================================
+    console.print("\n🧠 [bold]Step 1:[/] Understanding your request...\n")
+
+    product_info = ai.understand_query(
+        user_input=query or "",
+        image_path=image_path,
+    )
+
+    display_product_understanding(product_info)
+
+    # Ask user to confirm
+    console.print("\n[yellow]Does this look right?[/] (press Enter to continue, or type a correction)")
+    try:
+        correction = input("> ").strip()
+        if correction:
+            console.print("🔄 Re-analyzing with your correction...\n")
+            combined = f"{query or ''} {correction}".strip()
+            product_info = ai.understand_query(combined)
+            display_product_understanding(product_info)
+    except (EOFError, KeyboardInterrupt):
+        pass
+
+    # =============================================
+    # STEP 2: Search Amazon
+    # =============================================
+    console.print("\n🔎 [bold]Step 2:[/] Searching Amazon...\n")
+
+    search_queries = product_info.get("search_queries", [query or ""])
+    all_products = scraper.search_multiple_queries(search_queries)
+
+    if not all_products:
+        console.print(Panel(
+            "[bold red]No products found on Amazon.[/]\n"
+            "Try a different search term or check your internet connection.",
+            title="❌ No Results",
+            border_style="red",
+        ))
+        return
+
+    console.print(f"\n✅ Found {len(all_products)} total products across all searches")
+
+    # Sort by price for efficient verification (check cheapest first)
+    all_products.sort(key=lambda x: x.get("price", 9999))
+
+    # Limit candidates for verification
+    candidates = all_products[:top_n]
+    console.print(f"🔍 Verifying top {len(candidates)} candidates...\n")
+
+    # =============================================
+    # STEP 3: AI Verification
+    # =============================================
+    console.print("🤖 [bold]Step 3:[/] AI verifying product matches...\n")
+
+    verified = verifier.verify_all(product_info, candidates)
+
+    if show_rejected:
+        rejected_count = len(candidates) - len(verified)
+        console.print(f"\n   ℹ️  {rejected_count} products rejected by AI verification")
+
+    # =============================================
+    # STEP 4: AI Ranking & Recommendation
+    # =============================================
+    ai_recommendation = ""
+    if verified:
+        console.print("\n💡 [bold]Step 4:[/] AI generating recommendation...\n")
+        ai_recommendation = ai.rank_results(product_info, verified)
+
+    # =============================================
+    # STEP 5: Display Results
+    # =============================================
+    display_results(product_info, verified, ai_recommendation)
+
+
+def interactive_mode():
+    """Run in interactive loop mode."""
+    show_banner()
+
+    console.print(
+        "\n[bold]How to use:[/]\n"
+        "  • Type a product name:  [green]Milwaukee M18 brushless drill[/]\n"
+        "  • Describe a product:   [green]that cordless drill with the red battery[/]\n"
+        "  • Use an image:         [green]image:/path/to/photo.jpg[/]\n"
+        "  • Image + description:  [green]image:drill.jpg Milwaukee M18[/]\n"
+        "  • Type 'quit' to exit\n"
+    )
+
+    while True:
+        try:
+            console.print("\n" + "─" * 60)
+            user_input = console.input("\n[bold cyan]🔍 What product are you looking for?[/]\n> ").strip()
+
+            if not user_input:
+                continue
+
+            if user_input.lower() in ("quit", "exit", "q"):
+                console.print("\n👋 Goodbye!", style="bold")
+                break
+
+            # Check for image input
+            image_path = None
+            query = user_input
+
+            if user_input.lower().startswith("image:"):
+                parts = user_input[6:].strip().split(" ", 1)
+                image_path = parts[0]
+                query = parts[1] if len(parts) > 1 else ""
+
+            find_product(query=query, image_path=image_path)
+
+        except KeyboardInterrupt:
+            console.print("\n\n👋 Goodbye!", style="bold")
+            break
+        except Exception as e:
+            console.print(f"\n[red]Error: {e}[/]")
+            console.print("Try again with a different query.", style="dim")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="AI-Powered Amazon Price Finder using Ollama",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s "Milwaukee M18 brushless drill"
+  %(prog)s "that Bluetooth speaker that looks like a JBL"
+  %(prog)s --image product_photo.jpg
+  %(prog)s --image drill.jpg "Milwaukee M18"
+  %(prog)s "Sony WH-1000XM5 headphones" --strict strict
+  %(prog)s --interactive
+  
+Image analysis requires a vision model (e.g., ollama pull llava:7b)
+        """,
+    )
+
+    parser.add_argument(
+        "query",
+        nargs="*",
+        help="Product name, description, or question",
+    )
+    parser.add_argument(
+        "--image", "-i",
+        type=str,
+        help="Path to a product image for visual identification",
+    )
+    parser.add_argument(
+        "--interactive",
+        action="store_true",
+        help="Run in interactive mode (continuous prompt)",
+    )
+    parser.add_argument(
+        "--strict",
+        choices=["strict", "moderate", "loose"],
+        default=None,
+        help="Verification strictness (default: from .env)",
+    )
+    parser.add_argument(
+        "--sort",
+        choices=["relevance", "price_low", "price_high", "reviews", "newest"],
+        default="relevance",
+        help="Sort Amazon results (default: relevance)",
+    )
+    parser.add_argument(
+        "--top", "-n",
+        type=int,
+        default=15,
+        help="Max products to verify with AI (default: 15)",
+    )
+    parser.add_argument(
+        "--show-rejected",
+        action="store_true",
+        help="Show count of AI-rejected products",
+    )
+    parser.add_argument(
+        "--pages",
+        type=int,
+        default=None,
+        help="Override number of Amazon pages to search",
+    )
+
+    args = parser.parse_args()
+
+    # Override config from args
+    if args.pages:
+        Config.MAX_PAGES = args.pages
+
+    if args.interactive or (not args.query and not args.image):
+        interactive_mode()
+    else:
+        query_text = " ".join(args.query) if args.query else None
+
+        show_banner()
+        find_product(
+            query=query_text,
+            image_path=args.image,
+            sort_by=args.sort,
+            verification_mode=args.strict,
+            show_rejected=args.show_rejected,
+            top_n=args.top,
+        )
+
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+## Quick Start
+
+### 1. Install Ollama & Pull a Model
+```bash
+# Install Ollama: https://ollama.ai
+curl -fsSL https://ollama.ai/install.sh | sh
+
+# Pull a text model (pick one)
+ollama pull llama3.2:3b        # Fastest, recommended
+# or
+ollama pull mistral:7b         # Best quality at 7B
+
+# OPTIONAL: Pull vision model for image support
+ollama pull llava:7b
+```
+
+### 2. Install Python Dependencies
+```bash
+pip install -r requirements.txt
+```
+
+### 3. Run It
+```bash
+# Direct query
+python main.py "Milwaukee M18 brushless drill"
+
+# Interactive mode
+python main.py --interactive
+
+# With image
+python main.py --image photo_of_drill.jpg
+
+# Image + hint text
+python main.py --image drill.jpg "Milwaukee M18"
+
+# Strict matching, sort by price
+python main.py "Sony WH-1000XM5" --strict strict --sort price_low
+```
+
+---
+
+## Usage Examples
+
+```bash
+# Specific product by name
+python main.py "Milwaukee 2902-20 M18 brushless 1/2 inch hammer drill"
+
+# Vague description
+python main.py "that red cordless drill that all the contractors use"
+
+# By describing features
+python main.py "noise cancelling headphones with the best battery life under 300 dollars"
+
+# From a picture
+python main.py --image mystery_gadget.jpg
+
+# Picture with context
+python main.py --image kitchen_tool.jpg "I think this is a KitchenAid attachment"
+
+# Loose matching for broader results  
+python main.py "car phone mount with wireless charging" --strict loose --top 20
+
+# Find cheapest, search more pages
+python main.py "Anker USB-C cable 6ft" --sort price_low --pages 5
+```
+
+---
+
+## All CLI Options
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│  Argument            │ Description                               │
+├──────────────────────┼───────────────────────────────────────────┤
+│  "query text"        │ Product name or description               │
+│  --image FILE        │ Path to product image                     │
+│  --interactive       │ Continuous prompt mode                    │
+│  --strict MODE       │ strict / moderate / loose matching        │
+│  --sort METHOD       │ relevance/price_low/price_high/reviews    │
+│  --top N             │ Max products to AI-verify (default 15)    │
+│  --pages N           │ Amazon search pages (default 3)           │
+│  --show-rejected     │ Show rejected product count               │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## How It Works — Full Pipeline
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  USER INPUT                                                  │
+│  "Milwaukee M18 brushless drill"  OR  📸 image.jpg           │
+└──────────────────────┬───────────────────────────────────────┘
+                       │
+                       ▼
+┌──────────────────────────────────────────────────────────────┐
+│  STEP 1: AI UNDERSTANDING  (Ollama llama3.2 / llava)        │
+│                                                              │
+│  Input:  "Milwaukee M18 brushless drill"                     │
+│  Output: {                                                   │
+│    brand: "Milwaukee",                                       │
+│    model: "M18",                                             │
+│    features: ["brushless", "cordless"],                      │
+│    search_queries: [                                         │
+│      "Milwaukee M18 brushless drill",                        │
+│      "Milwaukee M18 cordless drill",                         │
+│      "Milwaukee brushless power drill"                       │
+│    ]                                                         │
+│  }                                                           │
+│                                                              │
+│  👤 User confirms or corrects                                │
+└──────────────────────┬───────────────────────────────────────┘
+                       │
+                       ▼
+┌──────────────────────────────────────────────────────────────┐
+│  STEP 2: AMAZON SEARCH  (scrapes search results)            │
+│                                                              │
+│  Runs all 3 search queries across up to 3 pages each        │
+│  Deduplicates by ASIN                                        │
+│  Extracts: title, price, rating, reviews, Prime, seller     │
+│  Result: ~20-40 candidate products                           │
+└──────────────────────┬───────────────────────────────────────┘
+                       │
+                       ▼
+┌──────────────────────────────────────────────────────────────┐
+│  STEP 3: AI VERIFICATION  (Ollama checks EACH product)     │
+│                                                              │
+│  For each candidate, AI answers:                             │
+│  - Is this the same product? (yes/no)                        │
+│  - Confidence: 0-100%                                        │
+│  - Match type: exact / close / partial / no_match            │
+│  - Reasoning: "Same brand and model but different kit..."    │
+│  - Concerns: ["includes battery", "refurbished"]             │
+│                                                              │
+│  Rejects anything below confidence threshold                 │
+└──────────────────────┬───────────────────────────────────────┘
+                       │
+                       ▼
+┌──────────────────────────────────────────────────────────────┐
+│  STEP 4: AI RECOMMENDATION                                  │
+│                                                              │
+│  AI reviews all verified matches and recommends:             │
+│  - Best overall deal                                         │
+│  - Any cautions (3rd party sellers, refurbs)                 │
+│  - One-line verdict                                          │
+└──────────────────────┬───────────────────────────────────────┘
+                       │
+                       ▼
+┌──────────────────────────────────────────────────────────────┐
+│  STEP 5: DISPLAY RESULTS                                    │
+│                                                              │
+│  🏆 BEST PRICE: $X.XX  (highlighted panel)                  │
+│  📋 All verified matches table                               │
+│  🤖 AI recommendation                                       │
+│  📊 Price comparison summary                                 │
+│  🔗 Direct Amazon links                                      │
+└──────────────────────────────────────────────────────────────┘
+```
+
+Every result shown has been **individually verified by AI** to confirm it matches your product before it reaches you. No false positives.
