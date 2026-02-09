@@ -98,3 +98,124 @@ Summary Table
 Direction	Library/Service	Code Style	Secure?
 Outbound (send)	Twilio, Vonage	SDK/API call	Yes, if using HTTPS and env vars
 Inbound (recv)	Twilio, Vonage	Express webhook	Yes, if HTTPS and signature validation
+
+1. MMS via Node.js: Sending and Receiving
+
+MMS (Multimedia Messaging Service) lets you send/receive images, videos, etc., over the mobile carrier network. You’ll need a provider with strong MMS support (e.g., Twilio, Nexmo/Vonage, Plivo).
+
+Send MMS (Outbound) Example with Twilio
+const twilio = require('twilio');
+const client = new twilio(process.env.TWILIO_SID, process.env.TWILIO_TOKEN);
+
+client.messages.create({
+    from: '+12345678901',
+    to: '+15551234567',
+    body: 'Here is a picture!',
+    mediaUrl: ['https://example.com/image.jpg']
+}).then(message => {
+    console.log(`MMS sent: ${message.sid}`);
+}).catch(console.error);
+
+
+The mediaUrl array holds one or more links to images/videos, accessible publicly by Twilio (HTTPS required).
+
+Receive MMS (Inbound) Example (Webhook)
+
+When someone sends an MMS to your Twilio number, Twilio POSTs a webhook with:
+
+From, To, Body (text, if any)
+
+NumMedia (number of media items)
+
+MediaUrl0, MediaContentType0, etc.
+
+Sample Express webhook:
+
+app.post('/sms/inbound', (req, res) => {
+    const from = req.body.From;
+    const numMedia = parseInt(req.body.NumMedia, 10);
+
+    let media = [];
+    for (let i = 0; i < numMedia; i++) {
+        media.push({
+            url: req.body[`MediaUrl${i}`],
+            type: req.body[`MediaContentType${i}`]
+        });
+    }
+    console.log(`Received MMS from ${from}:`, media);
+
+    // Process/store media URLs as needed, e.g. download and store securely
+    res.send('<Response></Response>');
+});
+
+
+Security: Always download/store media securely; media URLs are temporary and public for a short window.
+
+2. Features for an iMessage-like System
+
+To get closer to iMessage-level UX/security, consider:
+
+App-to-app encrypted messaging:
+Use WebSocket or push notification frameworks (like Firebase Cloud Messaging) for near-instant delivery, and libsodium
+ or similar for end-to-end encryption.
+
+Fallback to SMS/MMS for non-app users:
+Detect if recipient has your app (via registration/lookup); otherwise, use SMS/MMS as fallback.
+
+Media support:
+Store media on a secure CDN or blob storage; generate short-lived signed URLs.
+
+Push notifications:
+Alert users to new messages on mobile/desktop.
+
+Sync across devices:
+Store messages and media metadata in a secure database (e.g., PostgreSQL, encrypted-at-rest), and sync per user session.
+
+Authentication:
+Use strong authentication (OAuth2, JWTs), two-factor, and device registration.
+
+End-to-end encryption (optional but recommended):
+Encrypt messages in the client before sending to the server; only recipient(s) can decrypt.
+
+3. High-Level Node.js Architecture
+[Mobile/Web Client] <-- App-to-app over WebSocket/HTTPS, encrypted
+          |  ^
+          v  |
+   [Node.js Messaging Server] <-- REST API, WebSockets, stores in DB
+          | 
+     SMS/MMS Gateway (Twilio, etc.)
+          | 
+      [Carrier Network]
+
+4. Security Checklist
+
+HTTPS everywhere (no exceptions)
+
+Validate all inbound webhooks (Twilio signature validation)
+
+Download/store MMS media securely (do not expose direct URLs to clients)
+
+Encrypted storage for user data/messages/media
+
+Secure user authentication
+
+Logging, monitoring, rate limiting
+
+5. References
+
+Twilio MMS Docs
+
+Twilio Receive MMS Docs
+
+End-to-End Messaging with libsodium
+
+OWASP Mobile Messaging Security
+
+Summary Table: What You Can Build
+Feature	SMS/MMS API	App-to-App Messaging	Production-Ready
+Outbound SMS/MMS	Yes	Yes	Yes
+Inbound SMS/MMS	Yes (webhook)	Yes	Yes
+Media (images/video)	Yes (MMS)	Yes (encrypted CDN)	Yes
+Sync Across Devices	No	Yes	Yes
+End-to-End Encryption	No	Yes (custom)	Yes (custom)
+Apple iMessage Ecosystem	No (closed)	No	N/A
