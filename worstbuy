@@ -1,0 +1,2595 @@
+
+
+# AI-Powered Best Buy Price Finder — Multi-User, Multi-Input Architecture
+
+Built as a pluggable module for your AI OS vision: any input channel, any user, shared or isolated sessions.
+
+---
+
+## Project Structure
+
+```
+bestbuy_finder/
+├── core/
+│   ├── __init__.py
+│   ├── config.py
+│   ├── events.py              # Event bus for inter-module communication
+│   ├── user_manager.py        # Multi-user session & preference management
+│   ├── input_router.py        # Unified input from ANY channel
+│   └── plugin_registry.py     # Plugin system for extending functionality
+├── ai/
+│   ├── __init__.py
+│   ├── engine.py              # Ollama AI wrapper
+│   ├── intent_parser.py       # NLU – parse any input into structured intent
+│   └── conversation.py        # Multi-turn conversation state per user
+├── scrapers/
+│   ├── __init__.py
+│   ├── base.py                # Abstract scraper interface
+│   ├── bestbuy.py             # Best Buy scraper
+│   └── registry.py            # Scraper registry (add Amazon, Walmart, etc.)
+├── analysis/
+│   ├── __init__.py
+│   ├── deal_analyzer.py       # Best Buy deal scoring
+│   ├── price_history.py       # SQLite price tracking
+│   └── cross_compare.py       # Cross-store comparison engine
+├── verification/
+│   ├── __init__.py
+│   └── verifier.py            # AI product match verification
+├── channels/
+│   ├── __init__.py
+│   ├── base.py                # Abstract input/output channel
+│   ├── cli_channel.py         # Terminal / Rich CLI
+│   ├── rest_api.py            # REST API (FastAPI)
+│   ├── websocket_channel.py   # WebSocket real-time
+│   ├── discord_channel.py     # Discord bot
+│   ├── telegram_channel.py    # Telegram bot
+│   ├── voice_channel.py       # Voice input (Whisper)
+│   ├── file_watcher.py        # File drop / hot folder
+│   └── mqtt_channel.py        # IoT / MQTT
+├── output/
+│   ├── __init__.py
+│   ├── formatter.py           # Rich CLI formatter
+│   ├── json_output.py         # JSON API responses
+│   ├── html_output.py         # HTML email / web
+│   └── tts_output.py          # Text-to-speech
+├── storage/
+│   ├── __init__.py
+│   ├── database.py            # Multi-user SQLite manager
+│   └── cache.py               # Request/result caching
+├── main.py                    # Main entry point
+├── server.py                  # Multi-channel server
+├── requirements.txt
+├── .env
+└── data/
+    ├── users.db
+    ├── price_history.db
+    └── cache.db
+```
+
+---
+
+## 1. `requirements.txt`
+
+```text
+# Core
+requests>=2.31.0
+httpx>=0.27.0
+beautifulsoup4>=4.12.0
+lxml>=5.1.0
+selectolax>=0.3.21
+python-dotenv>=1.0.0
+rich>=13.7.0
+fake-useragent>=1.5.0
+Pillow>=10.0.0
+playwright>=1.44.0
+
+# Multi-channel server
+fastapi>=0.111.0
+uvicorn[standard]>=0.30.0
+websockets>=12.0
+python-multipart>=0.0.9
+
+# Bot channels
+discord.py>=2.3.0
+python-telegram-bot>=21.0
+paho-mqtt>=2.1.0
+
+# Voice (optional)
+openai-whisper>=20231117
+sounddevice>=0.4.7
+
+# Async
+aiofiles>=23.2.0
+aiosqlite>=0.20.0
+
+# Security
+pyjwt>=2.8.0
+bcrypt>=4.1.0
+cryptography>=42.0.0
+
+# Utilities
+pydantic>=2.7.0
+uuid6>=2024.1.12
+```
+
+---
+
+## 2. `.env`
+
+```env
+# ================================================
+# Ollama
+# ================================================
+OLLAMA_BASE_URL=http://localhost:11434
+OLLAMA_TEXT_MODEL=llama3.2:3b
+OLLAMA_VISION_MODEL=llava:7b
+
+# ================================================
+# Best Buy
+# ================================================
+BESTBUY_API_KEY=
+BESTBUY_SEARCH_METHOD=scrape
+MAX_PAGES=3
+MAX_RESULTS=25
+REQUEST_DELAY=2.0
+USE_BROWSER=true
+
+# ================================================
+# Multi-User
+# ================================================
+ENABLE_MULTI_USER=true
+DEFAULT_USER=default
+JWT_SECRET=change-this-to-a-real-secret-key
+SESSION_TIMEOUT_HOURS=24
+MAX_SESSIONS_PER_USER=5
+
+# ================================================
+# Input Channels
+# ================================================
+ENABLE_CLI=true
+ENABLE_REST_API=true
+REST_API_PORT=8420
+ENABLE_WEBSOCKET=true
+WEBSOCKET_PORT=8421
+ENABLE_DISCORD=false
+DISCORD_BOT_TOKEN=
+DISCORD_COMMAND_PREFIX=!bb
+ENABLE_TELEGRAM=false
+TELEGRAM_BOT_TOKEN=
+ENABLE_VOICE=false
+ENABLE_FILE_WATCHER=false
+FILE_WATCH_DIR=./inbox
+ENABLE_MQTT=false
+MQTT_BROKER=localhost
+MQTT_PORT=1883
+MQTT_TOPIC=aios/bestbuy/#
+
+# ================================================
+# Cross-Comparison
+# ================================================
+ENABLE_CROSS_COMPARE=true
+CROSS_COMPARE_STORES=amazon,walmart,homedepot,lowes
+
+# ================================================
+# Verification
+# ================================================
+MIN_MATCH_CONFIDENCE=70
+VERIFICATION_MODE=moderate
+
+# ================================================
+# Price Tracking
+# ================================================
+ENABLE_PRICE_HISTORY=true
+PRICE_DROP_ALERT_PCT=5.0
+
+# ================================================
+# Cache
+# ================================================
+CACHE_TTL_SECONDS=1800
+CACHE_MAX_SIZE_MB=500
+```
+
+---
+
+## 3. `core/__init__.py`
+
+```python
+```
+
+## 4. `core/config.py`
+
+```python
+"""
+Centralized configuration – loads from .env with layered overrides.
+Users can override per-session; admin settings remain global.
+"""
+
+import os
+from pathlib import Path
+from typing import Any, Optional
+from dotenv import load_dotenv
+
+load_dotenv()
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+
+class Config:
+    """Global configuration. User-level overrides handled by UserManager."""
+
+    # ── Ollama ──
+    OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+    OLLAMA_TEXT_MODEL: str = os.getenv("OLLAMA_TEXT_MODEL", "llama3.2:3b")
+    OLLAMA_VISION_MODEL: str = os.getenv("OLLAMA_VISION_MODEL", "llava:7b")
+
+    # ── Best Buy ──
+    BESTBUY_API_KEY: str = os.getenv("BESTBUY_API_KEY", "")
+    BESTBUY_SEARCH_METHOD: str = os.getenv("BESTBUY_SEARCH_METHOD", "scrape")
+    MAX_PAGES: int = int(os.getenv("MAX_PAGES", "3"))
+    MAX_RESULTS: int = int(os.getenv("MAX_RESULTS", "25"))
+    REQUEST_DELAY: float = float(os.getenv("REQUEST_DELAY", "2.0"))
+    USE_BROWSER: bool = os.getenv("USE_BROWSER", "true").lower() == "true"
+
+    # ── Multi-User ──
+    ENABLE_MULTI_USER: bool = os.getenv("ENABLE_MULTI_USER", "true").lower() == "true"
+    DEFAULT_USER: str = os.getenv("DEFAULT_USER", "default")
+    JWT_SECRET: str = os.getenv("JWT_SECRET", "change-this-to-a-real-secret-key")
+    SESSION_TIMEOUT_HOURS: int = int(os.getenv("SESSION_TIMEOUT_HOURS", "24"))
+    MAX_SESSIONS_PER_USER: int = int(os.getenv("MAX_SESSIONS_PER_USER", "5"))
+
+    # ── Channels ──
+    ENABLE_CLI: bool = os.getenv("ENABLE_CLI", "true").lower() == "true"
+    ENABLE_REST_API: bool = os.getenv("ENABLE_REST_API", "true").lower() == "true"
+    REST_API_PORT: int = int(os.getenv("REST_API_PORT", "8420"))
+    ENABLE_WEBSOCKET: bool = os.getenv("ENABLE_WEBSOCKET", "true").lower() == "true"
+    WEBSOCKET_PORT: int = int(os.getenv("WEBSOCKET_PORT", "8421"))
+    ENABLE_DISCORD: bool = os.getenv("ENABLE_DISCORD", "false").lower() == "true"
+    DISCORD_BOT_TOKEN: str = os.getenv("DISCORD_BOT_TOKEN", "")
+    DISCORD_COMMAND_PREFIX: str = os.getenv("DISCORD_COMMAND_PREFIX", "!bb")
+    ENABLE_TELEGRAM: bool = os.getenv("ENABLE_TELEGRAM", "false").lower() == "true"
+    TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    ENABLE_VOICE: bool = os.getenv("ENABLE_VOICE", "false").lower() == "true"
+    ENABLE_FILE_WATCHER: bool = os.getenv("ENABLE_FILE_WATCHER", "false").lower() == "true"
+    FILE_WATCH_DIR: str = os.getenv("FILE_WATCH_DIR", "./inbox")
+    ENABLE_MQTT: bool = os.getenv("ENABLE_MQTT", "false").lower() == "true"
+    MQTT_BROKER: str = os.getenv("MQTT_BROKER", "localhost")
+    MQTT_PORT: int = int(os.getenv("MQTT_PORT", "1883"))
+    MQTT_TOPIC: str = os.getenv("MQTT_TOPIC", "aios/bestbuy/#")
+
+    # ── Cross-Compare ──
+    ENABLE_CROSS_COMPARE: bool = os.getenv("ENABLE_CROSS_COMPARE", "true").lower() == "true"
+    CROSS_COMPARE_STORES: list[str] = [
+        s.strip()
+        for s in os.getenv("CROSS_COMPARE_STORES", "amazon,walmart,homedepot,lowes").split(",")
+        if s.strip()
+    ]
+
+    # ── Verification ──
+    MIN_MATCH_CONFIDENCE: int = int(os.getenv("MIN_MATCH_CONFIDENCE", "70"))
+    VERIFICATION_MODE: str = os.getenv("VERIFICATION_MODE", "moderate")
+    MODE_THRESHOLDS: dict = {"strict": 85, "moderate": 70, "loose": 55}
+
+    # ── Price History ──
+    ENABLE_PRICE_HISTORY: bool = os.getenv("ENABLE_PRICE_HISTORY", "true").lower() == "true"
+    PRICE_DROP_ALERT_PCT: float = float(os.getenv("PRICE_DROP_ALERT_PCT", "5.0"))
+
+    # ── Cache ──
+    CACHE_TTL_SECONDS: int = int(os.getenv("CACHE_TTL_SECONDS", "1800"))
+    CACHE_MAX_SIZE_MB: int = int(os.getenv("CACHE_MAX_SIZE_MB", "500"))
+
+    # ── Paths ──
+    DATA_DIR: Path = BASE_DIR / "data"
+    USERS_DB: Path = DATA_DIR / "users.db"
+    PRICE_DB: Path = DATA_DIR / "price_history.db"
+    CACHE_DB: Path = DATA_DIR / "cache.db"
+
+    @classmethod
+    def ensure_dirs(cls):
+        cls.DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    @classmethod
+    def get_confidence_threshold(cls) -> int:
+        return cls.MODE_THRESHOLDS.get(cls.VERIFICATION_MODE, 70)
+```
+
+---
+
+## 5. `core/events.py`
+
+```python
+"""
+Event bus – enables decoupled communication between modules.
+Any component can emit or listen. This is the backbone of the AI OS
+plugin architecture.
+"""
+
+import asyncio
+import time
+from collections import defaultdict
+from dataclasses import dataclass, field
+from typing import Any, Callable, Coroutine, Optional
+from uuid import uuid4
+
+
+@dataclass
+class Event:
+    """A single event on the bus."""
+
+    type: str                            # e.g. "search.started", "price.alert"
+    data: dict = field(default_factory=dict)
+    source: str = ""                     # originating module
+    user_id: str = ""                    # associated user
+    session_id: str = ""
+    event_id: str = field(default_factory=lambda: uuid4().hex[:12])
+    timestamp: float = field(default_factory=time.time)
+    reply_to: Optional[str] = None       # for request/response patterns
+    metadata: dict = field(default_factory=dict)
+
+    def reply(self, type: str, data: dict) -> "Event":
+        """Create a reply event."""
+        return Event(
+            type=type,
+            data=data,
+            source=self.source,
+            user_id=self.user_id,
+            session_id=self.session_id,
+            reply_to=self.event_id,
+        )
+
+
+Listener = Callable[[Event], Coroutine[Any, Any, None]] | Callable[[Event], None]
+
+
+class EventBus:
+    """
+    Async-first event bus with wildcard support.
+
+    Patterns:
+        "search.*"      → matches search.started, search.completed, etc.
+        "*.error"        → matches search.error, scrape.error, etc.
+        "*"              → matches everything (global listener)
+        "price.alert"    → exact match only
+    """
+
+    def __init__(self):
+        self._listeners: dict[str, list[Listener]] = defaultdict(list)
+        self._one_shot: dict[str, list[Listener]] = defaultdict(list)
+        self._history: list[Event] = []
+        self._max_history = 1000
+
+    def on(self, event_type: str, callback: Listener):
+        """Register a persistent listener."""
+        self._listeners[event_type].append(callback)
+
+    def once(self, event_type: str, callback: Listener):
+        """Register a one-shot listener."""
+        self._one_shot[event_type].append(callback)
+
+    def off(self, event_type: str, callback: Listener):
+        """Remove a listener."""
+        if callback in self._listeners.get(event_type, []):
+            self._listeners[event_type].remove(callback)
+
+    async def emit(self, event: Event):
+        """Emit an event and invoke all matching listeners."""
+        self._history.append(event)
+        if len(self._history) > self._max_history:
+            self._history = self._history[-self._max_history:]
+
+        matched = self._match_listeners(event.type)
+
+        for listener in matched:
+            try:
+                result = listener(event)
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception as e:
+                # Don't let one bad listener break the bus
+                print(f"[EventBus] Listener error for '{event.type}': {e}")
+
+    def _match_listeners(self, event_type: str) -> list[Listener]:
+        matched: list[Listener] = []
+
+        for pattern, listeners in self._listeners.items():
+            if self._pattern_matches(pattern, event_type):
+                matched.extend(listeners)
+
+        # One-shots
+        consumed_patterns = []
+        for pattern, listeners in self._one_shot.items():
+            if self._pattern_matches(pattern, event_type):
+                matched.extend(listeners)
+                consumed_patterns.append(pattern)
+        for p in consumed_patterns:
+            del self._one_shot[p]
+
+        return matched
+
+    @staticmethod
+    def _pattern_matches(pattern: str, event_type: str) -> bool:
+        if pattern == "*":
+            return True
+        if pattern == event_type:
+            return True
+        # Wildcard matching
+        if "*" in pattern:
+            parts = pattern.split(".")
+            type_parts = event_type.split(".")
+            if len(parts) != len(type_parts):
+                return False
+            return all(
+                p == "*" or p == t
+                for p, t in zip(parts, type_parts)
+            )
+        return False
+
+    async def wait_for(
+        self,
+        event_type: str,
+        timeout: float = 30.0,
+        predicate: Optional[Callable[[Event], bool]] = None,
+    ) -> Optional[Event]:
+        """Block until a matching event arrives or timeout."""
+        future: asyncio.Future[Event] = asyncio.get_event_loop().create_future()
+
+        def _handler(event: Event):
+            if predicate and not predicate(event):
+                return
+            if not future.done():
+                future.set_result(event)
+
+        self.once(event_type, _handler)
+
+        try:
+            return await asyncio.wait_for(future, timeout)
+        except asyncio.TimeoutError:
+            return None
+
+    def get_history(
+        self,
+        event_type: Optional[str] = None,
+        user_id: Optional[str] = None,
+        limit: int = 50,
+    ) -> list[Event]:
+        results = self._history
+        if event_type:
+            results = [e for e in results if self._pattern_matches(event_type, e.type)]
+        if user_id:
+            results = [e for e in results if e.user_id == user_id]
+        return results[-limit:]
+
+
+# Global singleton
+event_bus = EventBus()
+```
+
+---
+
+## 6. `core/user_manager.py`
+
+```python
+"""
+Multi-user session management – each user gets their own preferences,
+search history, conversation state, and price alerts.
+"""
+
+import time
+import sqlite3
+import json
+import hashlib
+import secrets
+from dataclasses import dataclass, field
+from typing import Any, Optional
+from uuid import uuid4
+
+import jwt
+import bcrypt
+
+from core.config import Config
+
+
+@dataclass
+class UserPreferences:
+    """Per-user overridable settings."""
+    verification_mode: str = "moderate"
+    max_results: int = 25
+    default_zip: str = ""
+    preferred_stores: list[str] = field(default_factory=lambda: ["bestbuy"])
+    enable_cross_compare: bool = True
+    price_alert_threshold: float = 5.0
+    output_format: str = "rich"          # rich | json | html | voice
+    notification_channels: list[str] = field(default_factory=list)  # email, discord, telegram, etc.
+    saved_searches: list[dict] = field(default_factory=list)
+    custom_data: dict = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        return {
+            "verification_mode": self.verification_mode,
+            "max_results": self.max_results,
+            "default_zip": self.default_zip,
+            "preferred_stores": self.preferred_stores,
+            "enable_cross_compare": self.enable_cross_compare,
+            "price_alert_threshold": self.price_alert_threshold,
+            "output_format": self.output_format,
+            "notification_channels": self.notification_channels,
+            "saved_searches": self.saved_searches,
+            "custom_data": self.custom_data,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "UserPreferences":
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+
+@dataclass
+class UserSession:
+    """An active session for a user."""
+    session_id: str = field(default_factory=lambda: uuid4().hex)
+    user_id: str = ""
+    channel: str = "cli"                 # which input channel created this
+    created_at: float = field(default_factory=time.time)
+    last_active: float = field(default_factory=time.time)
+    conversation_history: list[dict] = field(default_factory=list)
+    context: dict = field(default_factory=dict)  # current search context
+    is_active: bool = True
+
+    def touch(self):
+        self.last_active = time.time()
+
+    @property
+    def is_expired(self) -> bool:
+        timeout = Config.SESSION_TIMEOUT_HOURS * 3600
+        return (time.time() - self.last_active) > timeout
+
+
+class UserManager:
+    """
+    Manages users, sessions, preferences, and authentication.
+    Supports anonymous (single-user) and authenticated multi-user modes.
+    """
+
+    def __init__(self):
+        Config.ensure_dirs()
+        self.db_path = str(Config.USERS_DB)
+        self._sessions: dict[str, UserSession] = {}   # session_id → session
+        self._user_sessions: dict[str, list[str]] = {}  # user_id → [session_ids]
+        self._preferences: dict[str, UserPreferences] = {}
+        self._init_db()
+
+    def _init_db(self):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id TEXT PRIMARY KEY,
+                    username TEXT UNIQUE NOT NULL,
+                    password_hash TEXT NOT NULL,
+                    email TEXT,
+                    role TEXT DEFAULT 'user',
+                    preferences TEXT DEFAULT '{}',
+                    created_at REAL NOT NULL,
+                    last_login REAL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    query TEXT,
+                    results_count INTEGER DEFAULT 0,
+                    best_price REAL,
+                    channel TEXT,
+                    metadata TEXT DEFAULT '{}',
+                    timestamp REAL NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS saved_products (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id TEXT NOT NULL,
+                    product_id TEXT NOT NULL,
+                    store TEXT NOT NULL,
+                    title TEXT,
+                    target_price REAL,
+                    notify_on_drop INTEGER DEFAULT 1,
+                    created_at REAL NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_uh_user ON user_history(user_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sp_user ON saved_products(user_id)"
+            )
+
+            # Ensure default user exists
+            existing = conn.execute(
+                "SELECT user_id FROM users WHERE username = ?",
+                (Config.DEFAULT_USER,),
+            ).fetchone()
+            if not existing:
+                self._create_user_internal(
+                    conn, Config.DEFAULT_USER, "default", role="admin"
+                )
+
+    def _create_user_internal(
+        self,
+        conn: sqlite3.Connection,
+        username: str,
+        password: str,
+        role: str = "user",
+        email: str = "",
+    ) -> str:
+        user_id = uuid4().hex
+        pw_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+        conn.execute(
+            """
+            INSERT INTO users (user_id, username, password_hash, email, role, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (user_id, username, pw_hash, email, role, time.time()),
+        )
+        return user_id
+
+    # ── User CRUD ────────────────────────────────────────────
+
+    def create_user(
+        self,
+        username: str,
+        password: str,
+        email: str = "",
+        role: str = "user",
+    ) -> str:
+        with sqlite3.connect(self.db_path) as conn:
+            return self._create_user_internal(conn, username, password, role, email)
+
+    def authenticate(self, username: str, password: str) -> Optional[str]:
+        """Return user_id if credentials are valid."""
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT user_id, password_hash FROM users WHERE username = ?",
+                (username,),
+            ).fetchone()
+        if not row:
+            return None
+        if bcrypt.checkpw(password.encode(), row[1].encode()):
+            return row[0]
+        return None
+
+    def generate_token(self, user_id: str) -> str:
+        payload = {
+            "user_id": user_id,
+            "exp": time.time() + (Config.SESSION_TIMEOUT_HOURS * 3600),
+            "iat": time.time(),
+        }
+        return jwt.encode(payload, Config.JWT_SECRET, algorithm="HS256")
+
+    def validate_token(self, token: str) -> Optional[str]:
+        try:
+            payload = jwt.decode(token, Config.JWT_SECRET, algorithms=["HS256"])
+            if payload.get("exp", 0) < time.time():
+                return None
+            return payload.get("user_id")
+        except jwt.InvalidTokenError:
+            return None
+
+    # ── Sessions ─────────────────────────────────────────────
+
+    def create_session(
+        self,
+        user_id: Optional[str] = None,
+        channel: str = "cli",
+    ) -> UserSession:
+        if not user_id:
+            user_id = self._get_default_user_id()
+
+        # Enforce session limit
+        existing = self._user_sessions.get(user_id, [])
+        while len(existing) >= Config.MAX_SESSIONS_PER_USER:
+            oldest_id = existing.pop(0)
+            if oldest_id in self._sessions:
+                self._sessions[oldest_id].is_active = False
+                del self._sessions[oldest_id]
+
+        session = UserSession(user_id=user_id, channel=channel)
+        self._sessions[session.session_id] = session
+
+        if user_id not in self._user_sessions:
+            self._user_sessions[user_id] = []
+        self._user_sessions[user_id].append(session.session_id)
+
+        return session
+
+    def get_session(self, session_id: str) -> Optional[UserSession]:
+        session = self._sessions.get(session_id)
+        if session and not session.is_expired:
+            session.touch()
+            return session
+        elif session:
+            self.end_session(session_id)
+        return None
+
+    def end_session(self, session_id: str):
+        session = self._sessions.pop(session_id, None)
+        if session:
+            user_sessions = self._user_sessions.get(session.user_id, [])
+            if session_id in user_sessions:
+                user_sessions.remove(session_id)
+
+    def get_or_create_session(
+        self,
+        user_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        channel: str = "cli",
+    ) -> UserSession:
+        if session_id:
+            existing = self.get_session(session_id)
+            if existing:
+                return existing
+        return self.create_session(user_id=user_id, channel=channel)
+
+    # ── Preferences ──────────────────────────────────────────
+
+    def get_preferences(self, user_id: str) -> UserPreferences:
+        if user_id in self._preferences:
+            return self._preferences[user_id]
+
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT preferences FROM users WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+
+        if row and row[0]:
+            try:
+                prefs = UserPreferences.from_dict(json.loads(row[0]))
+            except (json.JSONDecodeError, TypeError):
+                prefs = UserPreferences()
+        else:
+            prefs = UserPreferences()
+
+        self._preferences[user_id] = prefs
+        return prefs
+
+    def update_preferences(self, user_id: str, updates: dict):
+        prefs = self.get_preferences(user_id)
+        for key, value in updates.items():
+            if hasattr(prefs, key):
+                setattr(prefs, key, value)
+
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "UPDATE users SET preferences = ? WHERE user_id = ?",
+                (json.dumps(prefs.to_dict()), user_id),
+            )
+        self._preferences[user_id] = prefs
+
+    # ── History ──────────────────────────────────────────────
+
+    def record_action(
+        self,
+        user_id: str,
+        action: str,
+        query: str = "",
+        results_count: int = 0,
+        best_price: Optional[float] = None,
+        channel: str = "",
+        metadata: Optional[dict] = None,
+    ):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO user_history
+                    (user_id, action, query, results_count, best_price, channel, metadata, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    user_id,
+                    action,
+                    query,
+                    results_count,
+                    best_price,
+                    channel,
+                    json.dumps(metadata or {}),
+                    time.time(),
+                ),
+            )
+
+    def get_user_history(
+        self,
+        user_id: str,
+        action: Optional[str] = None,
+        limit: int = 50,
+    ) -> list[dict]:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            if action:
+                rows = conn.execute(
+                    "SELECT * FROM user_history WHERE user_id = ? AND action = ? "
+                    "ORDER BY timestamp DESC LIMIT ?",
+                    (user_id, action, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM user_history WHERE user_id = ? "
+                    "ORDER BY timestamp DESC LIMIT ?",
+                    (user_id, limit),
+                ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ── Saved Products / Watchlist ───────────────────────────
+
+    def save_product(
+        self,
+        user_id: str,
+        product_id: str,
+        store: str,
+        title: str = "",
+        target_price: Optional[float] = None,
+    ):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO saved_products
+                    (user_id, product_id, store, title, target_price, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (user_id, product_id, store, title, target_price, time.time()),
+            )
+
+    def get_saved_products(self, user_id: str) -> list[dict]:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT * FROM saved_products WHERE user_id = ? ORDER BY created_at DESC",
+                (user_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def remove_saved_product(self, user_id: str, product_id: str, store: str):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "DELETE FROM saved_products WHERE user_id = ? AND product_id = ? AND store = ?",
+                (user_id, product_id, store),
+            )
+
+    # ── Helpers ──────────────────────────────────────────────
+
+    def _get_default_user_id(self) -> str:
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT user_id FROM users WHERE username = ?",
+                (Config.DEFAULT_USER,),
+            ).fetchone()
+        return row[0] if row else "default"
+
+    def cleanup_expired_sessions(self):
+        expired = [
+            sid
+            for sid, s in self._sessions.items()
+            if s.is_expired
+        ]
+        for sid in expired:
+            self.end_session(sid)
+        return len(expired)
+```
+
+---
+
+## 7. `core/input_router.py`
+
+```python
+"""
+Unified input router – accepts input from ANY channel, normalizes it
+into a standard InputMessage, and dispatches to the processing pipeline.
+
+This is the core abstraction that makes the system channel-agnostic.
+"""
+
+import asyncio
+import time
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Callable, Coroutine, Optional
+from uuid import uuid4
+
+from core.events import Event, event_bus
+from core.user_manager import UserManager, UserSession
+
+
+class InputType(Enum):
+    TEXT = "text"
+    IMAGE = "image"
+    VOICE = "voice"
+    COMMAND = "command"
+    FILE = "file"
+    ACTION = "action"           # button press, selection, etc.
+    STRUCTURED = "structured"   # pre-parsed JSON
+
+
+@dataclass
+class InputMessage:
+    """
+    Normalized input from any channel. Every interaction with the system
+    goes through this structure, regardless of whether it came from CLI,
+    REST API, Discord, Telegram, voice, MQTT, or a file drop.
+    """
+    input_id: str = field(default_factory=lambda: uuid4().hex[:16])
+    input_type: InputType = InputType.TEXT
+    channel: str = "unknown"         # cli, rest, ws, discord, telegram, voice, file, mqtt
+    user_id: str = ""
+    session_id: str = ""
+    timestamp: float = field(default_factory=time.time)
+
+    # Content (varies by type)
+    text: str = ""                   # for TEXT, COMMAND
+    image_path: str = ""             # for IMAGE
+    image_data: bytes = b""          # for IMAGE (raw bytes)
+    audio_path: str = ""             # for VOICE
+    audio_data: bytes = b""          # for VOICE (raw bytes)
+    file_path: str = ""              # for FILE
+    structured_data: dict = field(default_factory=dict)  # for STRUCTURED, ACTION
+    command: str = ""                # for COMMAND (parsed command name)
+    args: list[str] = field(default_factory=list)         # for COMMAND
+    kwargs: dict = field(default_factory=dict)             # for COMMAND
+
+    # Metadata
+    reply_to_message: Optional[str] = None
+    attachments: list[str] = field(default_factory=list)
+    metadata: dict = field(default_factory=dict)
+
+    def to_event(self) -> Event:
+        return Event(
+            type=f"input.{self.input_type.value}",
+            data={
+                "input_id": self.input_id,
+                "text": self.text,
+                "command": self.command,
+                "args": self.args,
+                "kwargs": self.kwargs,
+                "image_path": self.image_path,
+                "structured_data": self.structured_data,
+            },
+            source=self.channel,
+            user_id=self.user_id,
+            session_id=self.session_id,
+        )
+
+
+@dataclass
+class OutputMessage:
+    """
+    Normalized output – sent back to whatever channel originated the request.
+    """
+    output_id: str = field(default_factory=lambda: uuid4().hex[:16])
+    channel: str = "unknown"
+    user_id: str = ""
+    session_id: str = ""
+    input_id: str = ""               # which input this responds to
+    timestamp: float = field(default_factory=time.time)
+
+    # Content
+    text: str = ""
+    data: dict = field(default_factory=dict)     # structured result data
+    images: list[str] = field(default_factory=list)
+    tables: list[dict] = field(default_factory=list)
+    panels: list[dict] = field(default_factory=list)
+    actions: list[dict] = field(default_factory=list)  # suggested next actions
+    error: str = ""
+    is_final: bool = True            # False for streaming/partial responses
+
+
+# Type alias for handlers
+InputHandler = Callable[[InputMessage, UserSession], Coroutine[Any, Any, OutputMessage]]
+
+
+class InputRouter:
+    """
+    Routes normalized InputMessages to the appropriate handler.
+    Handles session resolution, rate limiting, and event emission.
+    """
+
+    def __init__(self, user_manager: UserManager):
+        self.user_manager = user_manager
+        self._handlers: dict[str, InputHandler] = {}        # command → handler
+        self._default_handler: Optional[InputHandler] = None
+        self._middleware: list[Callable] = []
+        self._rate_limits: dict[str, list[float]] = {}      # user_id → [timestamps]
+        self.rate_limit_per_minute = 30
+
+    # ── Handler Registration ─────────────────────────────────
+
+    def register_handler(self, command: str, handler: InputHandler):
+        """Register a handler for a specific command."""
+        self._handlers[command.lower()] = handler
+
+    def set_default_handler(self, handler: InputHandler):
+        """Handler for non-command text input (natural language)."""
+        self._default_handler = handler
+
+    def add_middleware(self, middleware: Callable):
+        """Add processing middleware (auth checks, logging, etc.)."""
+        self._middleware.append(middleware)
+
+    # ── Input Processing ─────────────────────────────────────
+
+    async def process(self, message: InputMessage) -> OutputMessage:
+        """Main entry point – process any input from any channel."""
+
+        # 1. Resolve session
+        session = self.user_manager.get_or_create_session(
+            user_id=message.user_id or None,
+            session_id=message.session_id or None,
+            channel=message.channel,
+        )
+        message.user_id = session.user_id
+        message.session_id = session.session_id
+
+        # 2. Rate limiting
+        if not self._check_rate_limit(message.user_id):
+            return OutputMessage(
+                channel=message.channel,
+                user_id=message.user_id,
+                session_id=message.session_id,
+                input_id=message.input_id,
+                error="Rate limit exceeded. Please wait a moment.",
+            )
+
+        # 3. Emit input event
+        await event_bus.emit(message.to_event())
+
+        # 4. Run middleware
+        for mw in self._middleware:
+            result = mw(message, session)
+            if asyncio.iscoroutine(result):
+                result = await result
+            if isinstance(result, OutputMessage):
+                return result  # middleware short-circuited
+
+        # 5. Route to handler
+        try:
+            output = await self._route(message, session)
+        except Exception as e:
+            output = OutputMessage(
+                channel=message.channel,
+                user_id=message.user_id,
+                session_id=message.session_id,
+                input_id=message.input_id,
+                error=f"Processing error: {str(e)}",
+            )
+
+        # 6. Emit output event
+        await event_bus.emit(
+            Event(
+                type="output.response",
+                data={"output_id": output.output_id, "has_error": bool(output.error)},
+                source="router",
+                user_id=message.user_id,
+                session_id=message.session_id,
+            )
+        )
+
+        # 7. Record in history
+        session.conversation_history.append(
+            {
+                "role": "user",
+                "content": message.text or message.command,
+                "timestamp": message.timestamp,
+            }
+        )
+        session.conversation_history.append(
+            {
+                "role": "assistant",
+                "content": output.text[:200] if output.text else "(structured)",
+                "timestamp": output.timestamp,
+            }
+        )
+
+        return output
+
+    async def _route(self, message: InputMessage, session: UserSession) -> OutputMessage:
+        """Determine which handler to invoke."""
+
+        # Command input
+        if message.input_type == InputType.COMMAND and message.command:
+            handler = self._handlers.get(message.command.lower())
+            if handler:
+                return await handler(message, session)
+            else:
+                return OutputMessage(
+                    channel=message.channel,
+                    user_id=message.user_id,
+                    session_id=message.session_id,
+                    input_id=message.input_id,
+                    error=f"Unknown command: {message.command}",
+                    actions=[
+                        {"type": "help", "label": "Show available commands"},
+                    ],
+                )
+
+        # Text input – check if it starts with a command prefix
+        if message.input_type == InputType.TEXT and message.text:
+            parsed = self._try_parse_command(message.text)
+            if parsed:
+                message.command = parsed[0]
+                message.args = parsed[1:]
+                message.input_type = InputType.COMMAND
+                handler = self._handlers.get(message.command.lower())
+                if handler:
+                    return await handler(message, session)
+
+        # Default handler (natural language, images, etc.)
+        if self._default_handler:
+            return await self._default_handler(message, session)
+
+        return OutputMessage(
+            channel=message.channel,
+            user_id=message.user_id,
+            session_id=message.session_id,
+            input_id=message.input_id,
+            error="No handler available for this input type.",
+        )
+
+    def _try_parse_command(self, text: str) -> Optional[list[str]]:
+        """Check if text is a slash command or starts with a known command."""
+        text = text.strip()
+
+        # Slash commands: /search, /compare, /watch, etc.
+        if text.startswith("/"):
+            parts = text[1:].split(maxsplit=1)
+            cmd = parts[0].lower()
+            if cmd in self._handlers:
+                args = parts[1].split() if len(parts) > 1 else []
+                return [cmd] + args
+
+        # Keyword commands: search ..., compare ..., watch ...
+        first_word = text.split()[0].lower() if text else ""
+        if first_word in self._handlers:
+            rest = text[len(first_word):].strip()
+            return [first_word] + (rest.split() if rest else [])
+
+        return None
+
+    def _check_rate_limit(self, user_id: str) -> bool:
+        now = time.time()
+        window = 60.0
+        timestamps = self._rate_limits.get(user_id, [])
+        timestamps = [t for t in timestamps if now - t < window]
+        self._rate_limits[user_id] = timestamps
+
+        if len(timestamps) >= self.rate_limit_per_minute:
+            return False
+
+        timestamps.append(now)
+        return True
+
+    def get_available_commands(self) -> list[str]:
+        return list(self._handlers.keys())
+```
+
+---
+
+## 8. `core/plugin_registry.py`
+
+```python
+"""
+Plugin registry – allows external modules to register themselves
+as scrapers, analyzers, channels, or any other component type.
+This is how you'll integrate Amazon, Walmart, Home Depot, Lowe's, etc.
+as drop-in plugins for the AI OS.
+"""
+
+from dataclasses import dataclass, field
+from typing import Any, Callable, Optional, Type
+
+
+@dataclass
+class PluginInfo:
+    name: str
+    version: str = "1.0.0"
+    description: str = ""
+    author: str = ""
+    plugin_type: str = "generic"     # scraper, analyzer, channel, formatter, etc.
+    capabilities: list[str] = field(default_factory=list)
+    config_schema: dict = field(default_factory=dict)
+    instance: Any = None
+    enabled: bool = True
+
+
+class PluginRegistry:
+    """
+    Central registry for all pluggable components.
+
+    Usage:
+        registry = PluginRegistry()
+
+        # Register a scraper
+        registry.register("bestbuy_scraper", BestBuyScraper(),
+                          plugin_type="scraper",
+                          capabilities=["search", "product_detail"])
+
+        # Get all scrapers
+        scrapers = registry.get_by_type("scraper")
+
+        # Get specific plugin
+        bb = registry.get("bestbuy_scraper")
+    """
+
+    def __init__(self):
+        self._plugins: dict[str, PluginInfo] = {}
+        self._hooks: dict[str, list[Callable]] = {}
+
+    def register(
+        self,
+        name: str,
+        instance: Any,
+        plugin_type: str = "generic",
+        version: str = "1.0.0",
+        description: str = "",
+        capabilities: Optional[list[str]] = None,
+        config_schema: Optional[dict] = None,
+    ):
+        info = PluginInfo(
+            name=name,
+            version=version,
+            description=description,
+            plugin_type=plugin_type,
+            capabilities=capabilities or [],
+            config_schema=config_schema or {},
+            instance=instance,
+        )
+        self._plugins[name] = info
+
+    def unregister(self, name: str):
+        self._plugins.pop(name, None)
+
+    def get(self, name: str) -> Optional[Any]:
+        info = self._plugins.get(name)
+        return info.instance if info and info.enabled else None
+
+    def get_info(self, name: str) -> Optional[PluginInfo]:
+        return self._plugins.get(name)
+
+    def get_by_type(self, plugin_type: str) -> list[Any]:
+        return [
+            p.instance
+            for p in self._plugins.values()
+            if p.plugin_type == plugin_type and p.enabled
+        ]
+
+    def get_by_capability(self, capability: str) -> list[Any]:
+        return [
+            p.instance
+            for p in self._plugins.values()
+            if capability in p.capabilities and p.enabled
+        ]
+
+    def list_plugins(self) -> list[PluginInfo]:
+        return list(self._plugins.values())
+
+    def enable(self, name: str):
+        if name in self._plugins:
+            self._plugins[name].enabled = True
+
+    def disable(self, name: str):
+        if name in self._plugins:
+            self._plugins[name].enabled = False
+
+    # ── Hook system for plugin lifecycle ─────────────────────
+
+    def register_hook(self, hook_name: str, callback: Callable):
+        if hook_name not in self._hooks:
+            self._hooks[hook_name] = []
+        self._hooks[hook_name].append(callback)
+
+    async def run_hook(self, hook_name: str, *args, **kwargs):
+        import asyncio
+
+        for callback in self._hooks.get(hook_name, []):
+            result = callback(*args, **kwargs)
+            if asyncio.iscoroutine(result):
+                await result
+
+
+# Global singleton
+plugin_registry = PluginRegistry()
+```
+
+---
+
+## 9. `ai/engine.py`
+
+```python
+"""
+AI Engine – Ollama wrapper for query understanding, image analysis,
+verification, and recommendation.
+"""
+
+import json
+import re
+import base64
+import httpx
+from pathlib import Path
+from typing import Optional
+
+from core.config import Config
+
+
+class AIEngine:
+
+    def __init__(self):
+        self.base_url = Config.OLLAMA_BASE_URL.rstrip("/")
+        self.text_model = Config.OLLAMA_TEXT_MODEL
+        self.vision_model = Config.OLLAMA_VISION_MODEL
+        self.client = httpx.Client(timeout=120.0)
+
+    def _generate(
+        self,
+        prompt: str,
+        model: Optional[str] = None,
+        images: Optional[list[str]] = None,
+        temperature: float = 0.3,
+    ) -> str:
+        model = model or self.text_model
+        payload = {
+            "model": model,
+            "prompt": prompt,
+            "stream": False,
+            "options": {"temperature": temperature},
+        }
+        if images:
+            payload["images"] = images
+        resp = self.client.post(f"{self.base_url}/api/generate", json=payload)
+        resp.raise_for_status()
+        return resp.json().get("response", "")
+
+    @staticmethod
+    def _image_to_base64(path: str) -> str:
+        return base64.b64encode(Path(path).read_bytes()).decode()
+
+    @staticmethod
+    def _extract_json(text: str) -> dict:
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            pass
+        m = re.search(r"\{[\s\S]*\}", text)
+        if m:
+            try:
+                return json.loads(m.group())
+            except json.JSONDecodeError:
+                pass
+        return {}
+
+    def check_connection(self) -> bool:
+        try:
+            return self.client.get(f"{self.base_url}/api/tags").status_code == 200
+        except Exception:
+            return False
+
+    def list_models(self) -> list[str]:
+        try:
+            r = self.client.get(f"{self.base_url}/api/tags")
+            r.raise_for_status()
+            return [m["name"] for m in r.json().get("models", [])]
+        except Exception:
+            return []
+
+    def understand_query(self, query: str) -> dict:
+        prompt = f"""Analyze this product search query and extract structured information.
+
+Query: "{query}"
+
+Return JSON only:
+{{
+    "product_type": "main product category",
+    "brand": "brand name or empty string",
+    "model": "model number or empty string",
+    "key_features": ["list", "of", "important", "features"],
+    "specifications": {{"key": "value pairs"}},
+    "search_queries": ["primary search", "alt 1", "alt 2"],
+    "category_hint": "one of: computers, tvs, phones, audio, cameras, gaming, appliances, smart_home, car_electronics, wearables, tablets, networking, storage, software, accessories, other",
+    "price_range_hint": "budget|midrange|premium|any",
+    "use_case": "what the user likely needs this for"
+}}"""
+        result = self._extract_json(self._generate(prompt))
+        if not result.get("search_queries"):
+            result["search_queries"] = [query]
+        if not result.get("product_type"):
+            result["product_type"] = query
+        return result
+
+    def analyze_image(self, image_path: str) -> dict:
+        b64 = self._image_to_base64(image_path)
+        prompt = """Analyze this product image and identify it.
+
+Return JSON only:
+{
+    "product_type": "what the product is",
+    "brand": "visible brand or empty string",
+    "model": "model number if visible or empty string",
+    "color": "color or finish",
+    "key_features": ["visible features"],
+    "estimated_category": "computers, tvs, phones, audio, cameras, gaming, appliances, smart_home, car_electronics, wearables, tablets, networking, storage, software, accessories, other",
+    "search_queries": ["best search query", "alternative"],
+    "description": "short description"
+}"""
+        result = self._extract_json(
+            self._generate(prompt, model=self.vision_model, images=[b64])
+        )
+        if not result.get("search_queries"):
+            result["search_queries"] = [result.get("product_type", "product")]
+        return result
+
+    def verify_product_match(self, query_info: dict, product: dict) -> dict:
+        prompt = f"""Compare SEARCHED product to FOUND product and assess match quality.
+
+SEARCHED:
+- Product type: {query_info.get("product_type", "unknown")}
+- Brand: {query_info.get("brand", "any")}
+- Model: {query_info.get("model", "any")}
+- Features: {query_info.get("key_features", [])}
+- Specs: {query_info.get("specifications", {{}})}
+- Category: {query_info.get("category_hint", "other")}
+
+FOUND on Best Buy:
+- Title: {product.get("title", "unknown")}
+- Brand: {product.get("brand", "unknown")}
+- Model: {product.get("model_number", "unknown")}
+- SKU: {product.get("sku", "unknown")}
+- Price: ${product.get("price", "unknown")}
+- Rating: {product.get("rating", "N/A")} ({product.get("review_count", 0)} reviews)
+- Category: {product.get("category", "unknown")}
+
+Return JSON only:
+{{
+    "confidence": <0-100>,
+    "is_match": <true/false>,
+    "match_type": "exact|close|partial|different",
+    "brand_match": <true/false>,
+    "model_match": <true/false>,
+    "category_match": <true/false>,
+    "feature_overlap": <0-100>,
+    "concerns": ["list of concerns"],
+    "explanation": "brief explanation"
+}}"""
+        result = self._extract_json(self._generate(prompt))
+        if "confidence" not in result:
+            result = {"confidence": 0, "is_match": False, "match_type": "unknown"}
+        return result
+
+    def generate_recommendation(
+        self,
+        query_info: dict,
+        products: list[dict],
+        analyses: list[dict],
+    ) -> str:
+        summaries = []
+        for i, (p, a) in enumerate(zip(products, analyses), 1):
+            summaries.append(
+                f"{i}. {p.get('title','?')} - ${p.get('price','?')}\n"
+                f"   Rating: {p.get('rating','N/A')}/5 ({p.get('review_count',0)} reviews)\n"
+                f"   Brand: {p.get('brand','?')} | Deal Score: {a.get('deal_score',0)}/100\n"
+                f"   Open-Box: {'Yes' if p.get('open_box_available') else 'No'} | "
+                f"   Member Deal: {'Yes' if a.get('has_totaltech_benefit') else 'No'}"
+            )
+        prompt = f"""You are a consumer electronics expert. Recommend the best option.
+
+User searched for: {query_info.get("product_type", "product")}
+Brand preference: {query_info.get("brand", "none")}
+Budget: {query_info.get("price_range_hint", "any")}
+Use case: {query_info.get("use_case", "general")}
+
+Top options at Best Buy:
+{chr(10).join(summaries)}
+
+Give a concise recommendation (3-5 sentences):
+1. Your top pick and WHY
+2. Best value option if different
+3. Whether to buy now or wait
+4. Mention relevant Best Buy programs (My Best Buy, Totaltech, open-box, price match)
+5. Any important specs to watch for in this category"""
+        return self._generate(prompt, temperature=0.5)
+
+    def parse_natural_language(self, text: str, conversation_context: list[dict]) -> dict:
+        """Parse free-form user input into a structured intent."""
+        recent = conversation_context[-5:] if conversation_context else []
+        context_str = "\n".join(
+            f"  {m['role']}: {m['content']}" for m in recent
+        ) or "  (no prior conversation)"
+
+        prompt = f"""Parse this user message into a structured intent for a product search system.
+
+Recent conversation:
+{context_str}
+
+New message: "{text}"
+
+Return JSON only:
+{{
+    "intent": "search|compare|watch|detail|save|history|help|settings|unknown",
+    "query": "extracted search query or empty",
+    "product_number": "specific result number if referenced",
+    "store_filter": "bestbuy|amazon|walmart|any",
+    "action_params": {{}},
+    "requires_clarification": false,
+    "clarification_question": ""
+}}"""
+        result = self._extract_json(self._generate(prompt))
+        if not result.get("intent"):
+            result["intent"] = "search"
+            result["query"] = text
+        return result
+
+    def close(self):
+        self.client.close()
+```
+
+---
+
+## 10. `ai/intent_parser.py`
+
+```python
+"""
+Intent parser – converts raw input from any channel into actionable intents.
+Works with the AI engine for NLU but also has fast-path regex parsing
+for common commands.
+"""
+
+import re
+from dataclasses import dataclass, field
+from typing import Optional
+
+from ai.engine import AIEngine
+
+
+@dataclass
+class ParsedIntent:
+    intent: str = "search"               # search, compare, watch, detail, save, remove, history, settings, help, login, register, alerts, unknown
+    query: str = ""
+    product_number: Optional[int] = None  # "tell me about #3"
+    store_filter: str = "any"
+    image_path: str = ""
+    action_params: dict = field(default_factory=dict)
+    raw_text: str = ""
+    confidence: float = 1.0
+    requires_clarification: bool = False
+    clarification_question: str = ""
+
+
+class IntentParser:
+    """
+    Two-stage intent parsing:
+    1. Fast regex matching for common patterns
+    2. AI-based NLU for everything else
+    """
+
+    # Common command patterns
+    PATTERNS = [
+        (r"^(?:search|find|look\s*for|show\s*me)\s+(.+)", "search"),
+        (r"^compare\s+(.+)", "compare"),
+        (r"^(?:watch|track|monitor|alert)\s+(.+)", "watch"),
+        (r"^(?:detail|details|info|more)\s+(?:on\s+)?#?(\d+)", "detail"),
+        (r"^(?:save|bookmark|favorite)\s+#?(\d+)", "save"),
+        (r"^(?:remove|unsave|delete)\s+#?(\d+)", "remove"),
+        (r"^(?:history|recent|past)\s*(?:searches)?", "history"),
+        (r"^(?:settings?|preferences?|config)", "settings"),
+        (r"^(?:help|\?|commands?)", "help"),
+        (r"^(?:login|signin|auth)\s+(\S+)\s+(\S+)", "login"),
+        (r"^(?:register|signup|create\s*account)\s+(\S+)\s+(\S+)", "register"),
+        (r"^(?:alerts?|notifications?|drops?)", "alerts"),
+        (r"^(?:watchlist|saved|favorites|bookmarks)", "watchlist"),
+        (r"^(?:#|number\s*)(\d+)", "detail"),
+    ]
+
+    def __init__(self, ai_engine: Optional[AIEngine] = None):
+        self.ai = ai_engine
+        self._compiled = [(re.compile(p, re.I), intent) for p, intent in self.PATTERNS]
+
+    def parse(
+        self,
+        text: str,
+        conversation_context: Optional[list[dict]] = None,
+        image_path: str = "",
+    ) -> ParsedIntent:
+        text = text.strip()
+        if not text and not image_path:
+            return ParsedIntent(intent="help", raw_text=text)
+
+        # Image input → automatic search intent
+        if image_path:
+            return ParsedIntent(
+                intent="search",
+                image_path=image_path,
+                query=text,
+                raw_text=text,
+            )
+
+        # Fast path: regex matching
+        for pattern, intent in self._compiled:
+            m = pattern.match(text)
+            if m:
+                return self._build_from_regex(intent, m, text)
+
+        # AI path: natural language understanding
+        if self.ai:
+            return self._parse_with_ai(text, conversation_context or [])
+
+        # Fallback: treat as search
+        return ParsedIntent(intent="search", query=text, raw_text=text)
+
+    def _build_from_regex(self, intent: str, match: re.Match, raw: str) -> ParsedIntent:
+        parsed = ParsedIntent(intent=intent, raw_text=raw, confidence=0.95)
+
+        if intent == "search":
+            parsed.query = match.group(1).strip()
+        elif intent == "compare":
+            parsed.query = match.group(1).strip()
+        elif intent == "watch":
+            parsed.query = match.group(1).strip()
+        elif intent in ("detail", "save", "remove"):
+            try:
+                parsed.product_number = int(match.group(1))
+            except (ValueError, IndexError):
+                pass
+        elif intent == "login":
+            parsed.action_params = {
+                "username": match.group(1),
+                "password": match.group(2),
+            }
+        elif intent == "register":
+            parsed.action_params = {
+                "username": match.group(1),
+                "password": match.group(2),
+            }
+
+        return parsed
+
+    def _parse_with_ai(self, text: str, context: list[dict]) -> ParsedIntent:
+        try:
+            result = self.ai.parse_natural_language(text, context)
+            return ParsedIntent(
+                intent=result.get("intent", "search"),
+                query=result.get("query", text),
+                product_number=(
+                    int(result["product_number"])
+                    if result.get("product_number")
+                    else None
+                ),
+                store_filter=result.get("store_filter", "any"),
+                action_params=result.get("action_params", {}),
+                raw_text=text,
+                confidence=0.8,
+                requires_clarification=result.get("requires_clarification", False),
+                clarification_question=result.get("clarification_question", ""),
+            )
+        except Exception:
+            return ParsedIntent(intent="search", query=text, raw_text=text, confidence=0.5)
+```
+
+---
+
+## 11. `ai/conversation.py`
+
+```python
+"""
+Per-user conversation state manager – enables multi-turn interactions
+regardless of input channel.
+"""
+
+from dataclasses import dataclass, field
+from typing import Any, Optional
+
+
+@dataclass
+class ConversationState:
+    """Tracks the current context of a user's interaction."""
+    last_query: str = ""
+    last_query_info: dict = field(default_factory=dict)
+    last_results: list[dict] = field(default_factory=list)
+    last_analyses: list[dict] = field(default_factory=list)
+    last_comparison: dict = field(default_factory=dict)
+    selected_product: Optional[dict] = None
+    turn_count: int = 0
+
+    def update_search(self, query: str, query_info: dict, results: list, analyses: list):
+        self.last_query = query
+        self.last_query_info = query_info
+        self.last_results = results
+        self.last_analyses = analyses
+        self.selected_product = None
+        self.turn_count += 1
+
+    def get_product_by_number(self, number: int) -> Optional[dict]:
+        if 1 <= number <= len(self.last_results):
+            return self.last_results[number - 1]
+        return None
+
+    def clear(self):
+        self.last_query = ""
+        self.last_query_info = {}
+        self.last_results = []
+        self.last_analyses = []
+        self.last_comparison = {}
+        self.selected_product = None
+
+
+class ConversationManager:
+    """Manages conversation states per user-session."""
+
+    def __init__(self):
+        self._states: dict[str, ConversationState] = {}
+
+    def get_state(self, session_id: str) -> ConversationState:
+        if session_id not in self._states:
+            self._states[session_id] = ConversationState()
+        return self._states[session_id]
+
+    def clear_state(self, session_id: str):
+        if session_id in self._states:
+            self._states[session_id].clear()
+
+    def remove_state(self, session_id: str):
+        self._states.pop(session_id, None)
+```
+
+---
+
+## 12. `scrapers/base.py`
+
+```python
+"""
+Abstract scraper interface – all store scrapers implement this.
+This makes adding new stores trivial.
+"""
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from typing import Optional
+
+
+@dataclass
+class ScrapedProduct:
+    """Universal product representation across all stores."""
+    # Identity
+    product_id: str = ""
+    sku: str = ""
+    model_number: str = ""
+    upc: str = ""
+
+    # Core info
+    title: str = ""
+    brand: str = ""
+    description: str = ""
+    category: str = ""
+
+    # Pricing
+    price: Optional[float] = None
+    was_price: Optional[float] = None
+    sale_price: Optional[float] = None
+    unit_price: str = ""
+    savings: Optional[float] = None
+    savings_pct: Optional[float] = None
+    on_sale: bool = False
+
+    # Reviews
+    rating: Optional[float] = None
+    review_count: int = 0
+
+    # URLs
+    url: str = ""
+    image_url: str = ""
+
+    # Availability
+    in_store_available: Optional[bool] = None
+    online_available: Optional[bool] = None
+    shipping_available: Optional[bool] = None
+    free_shipping: bool = False
+    pickup_available: Optional[bool] = None
+
+    # Store-specific
+    store_name: str = ""                 # "bestbuy", "amazon", etc.
+    badge: str = ""
+    sponsored: bool = False
+    condition: str = "new"               # new, open-box, refurbished, used
+    membership_price: Optional[float] = None  # Prime, Totaltech, etc.
+    open_box_price: Optional[float] = None
+    warranty_info: str = ""
+
+    # Metadata
+    extra: dict = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        return {k: v for k, v in self.__dict__.items() if v is not None and v != "" and v != [] and v != {}}
+
+    def __repr__(self):
+        return f"<{self.store_name}:{self.product_id} '{self.title[:40]}' ${self.price}>"
+
+
+class BaseScraper(ABC):
+    """Interface that every store scraper must implement."""
+
+    store_name: str = "unknown"
+
+    @abstractmethod
+    async def search(self, query: str) -> list[ScrapedProduct]:
+        """Search for products."""
+        ...
+
+    @abstractmethod
+    async def get_product_details(self, product_id: str) -> Optional[ScrapedProduct]:
+        """Get detailed product info by ID/SKU."""
+        ...
+
+    async def search_by_upc(self, upc: str) -> Optional[ScrapedProduct]:
+        """Search by UPC barcode (if supported)."""
+        return None
+
+    async def close(self):
+        """Cleanup resources."""
+        pass
+```
+
+---
+
+## 13. `scrapers/bestbuy.py`
+
+```python
+"""
+Best Buy scraper – supports:
+  1. Best Buy Products API (if API key provided)
+  2. Playwright-based browser scraping
+  3. Static HTML scraping as fallback
+"""
+
+import json
+import re
+import time
+import random
+from typing import Optional
+from urllib.parse import quote_plus, urljoin
+
+import requests
+from bs4 import BeautifulSoup
+from fake_useragent import UserAgent
+
+from core.config import Config
+from scrapers.base import BaseScraper, ScrapedProduct
+
+
+class BestBuyScraper(BaseScraper):
+    """Best Buy product search and detail scraper."""
+
+    store_name = "bestbuy"
+    BASE_URL = "https://www.bestbuy.com"
+    SEARCH_URL = "https://www.bestbuy.com/site/searchpage.jsp?st={query}&cp={page}"
+    API_BASE = "https://api.bestbuy.com/v1"
+
+    def __init__(self):
+        self.ua = UserAgent()
+        self.api_key = Config.BESTBUY_API_KEY
+        self.search_method = Config.BESTBUY_SEARCH_METHOD
+        self.max_pages = Config.MAX_PAGES
+        self.max_results = Config.MAX_RESULTS
+        self.delay = Config.REQUEST_DELAY
+        self.use_browser = Config.USE_BROWSER
+        self._browser = None
+        self._context = None
+        self._playwright = None
+
+    # ── Browser lifecycle ────────────────────────────────────
+
+    async def _ensure_browser(self):
+        if self._browser is None:
+            from playwright.async_api import async_playwright
+
+            self._playwright = await async_playwright().start()
+            self._browser = await self._playwright.chromium.launch(headless=True)
+            self._context = await self._browser.new_context(
+                user_agent=self.ua.random,
+                viewport={"width": 1920, "height": 1080},
+                locale="en-US",
+            )
+
+    async def close(self):
+        if self._browser:
+            await self._browser.close()
+        if self._playwright:
+            await self._playwright.stop()
+        self._browser = None
+        self._context = None
+        self._playwright = None
+
+    # ── Headers ──────────────────────────────────────────────
+
+    def _headers(self) -> dict:
+        return {
+            "User-Agent": self.ua.random,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "DNT": "1",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+        }
+
+    # ── Search entry point ───────────────────────────────────
+
+    async def search(self, query: str) -> list[ScrapedProduct]:
+        # Try API first if key is available
+        if self.api_key and self.search_method in ("api", "both"):
+            products = self._search_api(query)
+            if products:
+                return products[: self.max_results]
+
+        # Scraping path
+        return await self._search_scrape(query)
+
+    async def _search_scrape(self, query: str) -> list[ScrapedProduct]:
+        all_products: list[ScrapedProduct] = []
+        seen: set[str] = set()
+        encoded = quote_plus(query)
+
+        for page_num in range(1, self.max_pages + 1):
+            url = self.SEARCH_URL.format(query=encoded, page=page_num)
+
+            try:
+                if self.use_browser:
+                    html = await self._fetch_browser(url)
+                else:
+                    html = self._fetch_static(url)
+            except Exception as exc:
+                print(f"[bestbuy] page {page_num} failed: {exc}")
+                break
+
+            products = self._parse_search_page(html)
+            if not products:
+                break
+
+            for p in products:
+                key = p.sku or p.product_id or p.title
+                if key and key not in seen:
+                    seen.add(key)
+                    all_products.append(p)
+
+            if len(all_products) >= self.max_results:
+                break
+
+            time.sleep(self.delay + random.uniform(0.5, 2.0))
+
+        return all_products[: self.max_results]
+
+    # ── API search ───────────────────────────────────────────
+
+    def _search_api(self, query: str) -> list[ScrapedProduct]:
+        """Use the Best Buy Products API."""
+        products: list[ScrapedProduct] = []
+
+        # Best Buy API search syntax
+        params = {
+            "apiKey": self.api_key,
+            "format": "json",
+            "show": (
+                "sku,name,salePrice,regularPrice,onSale,savings,percentSavings,"
+                "customerReviewAverage,customerReviewCount,url,image,"
+                "manufacturer,modelNumber,upc,categoryPath,freeShipping,"
+                "inStoreAvailability,onlineAvailability,inStorePickup,"
+                "shortDescription,longDescription,condition,openBoxPrice,"
+                "type,class"
+            ),
+            "pageSize": min(self.max_results, 100),
+            "page": 1,
+        }
+
+        # Build search string
+        search_terms = query.replace(" ", "&search=")
+        url = f"{self.API_BASE}/products(search={search_terms})"
+
+        try:
+            resp = requests.get(url, params=params, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as exc:
+            print(f"[bestbuy-api] Error: {exc}")
+            return []
+
+        for item in data.get("products", []):
+            p = self._normalize_api_product(item)
+            if p:
+                products.append(p)
+
+        return products
+
+    def _normalize_api_product(self, item: dict) -> Optional[ScrapedProduct]:
+        sale_price = item.get("salePrice")
+        regular_price = item.get("regularPrice")
+        price = sale_price or regular_price
+
+        savings = item.get("savings")
+        savings_pct = item.get("percentSavings")
+        on_sale = item.get("onSale", False)
+
+        open_box_price = item.get("openBoxPrice")
+
+        category_parts = item.get("categoryPath", [])
+        category = ""
+        if isinstance(category_parts, list):
+            names = [c.get("name", "") for c in category_parts if isinstance(c, dict)]
+            category = " > ".join(names)
+        elif isinstance(category_parts, str):
+            category = category_parts
+
+        return ScrapedProduct(
+            product_id=str(item.get("sku", "")),
+            sku=str(item.get("sku", "")),
+            model_number=item.get("modelNumber", ""),
+            upc=item.get("upc", ""),
+            title=item.get("name", ""),
+            brand=item.get("manufacturer", ""),
+            description=item.get("shortDescription", ""),
+            category=category,
+            price=price,
+            was_price=regular_price if on_sale else None,
+            sale_price=sale_price if on_sale else None,
+            savings=savings,
+            savings_pct=savings_pct,
+            on_sale=on_sale,
+            rating=item.get("customerReviewAverage"),
+            review_count=item.get("customerReviewCount", 0),
+            url=item.get("url", ""),
+            image_url=item.get("image", ""),
+            in_store_available=item.get("inStoreAvailability"),
+            online_available=item.get("onlineAvailability"),
+            free_shipping=item.get("freeShipping", False),
+            pickup_available=item.get("inStorePickup"),
+            store_name="bestbuy",
+            condition=item.get("condition", "new"),
+            open_box_price=open_box_price,
+        )
+
+    # ── Page fetching ────────────────────────────────────────
+
+    def _fetch_static(self, url: str) -> str:
+        resp = requests.get(url, headers=self._headers(), timeout=20)
+        resp.raise_for_status()
+        return resp.text
+
+    async def _fetch_browser(self, url: str) -> str:
+        await self._ensure_browser()
+        page = await self._context.new_page()
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+            try:
+                await page.wait_for_selector(
+                    '.sku-item, [data-testid="sku-item"], .list-item',
+                    timeout=8_000,
+                )
+            except Exception:
+                pass
+            for _ in range(3):
+                await page.evaluate("window.scrollBy(0, 800)")
+                await page.wait_for_timeout(500)
+            return await page.content()
+        finally:
+            await page.close()
+
+    # ── HTML parsing ─────────────────────────────────────────
+
+    def _parse_search_page(self, html: str) -> list[ScrapedProduct]:
+        # Try embedded JSON first
+        products = self._extract_json_data(html)
+        if products:
+            return products
+        return self._parse_dom(html)
+
+    def _extract_json_data(self, html: str) -> list[ScrapedProduct]:
+        products: list[ScrapedProduct] = []
+        soup = BeautifulSoup(html, "lxml")
+
+        # __NEXT_DATA__
+        script = soup.find("script", {"id": "__NEXT_DATA__"})
+        if script and script.string:
+            try:
+                data = json.loads(script.string)
+                items = self._dig_for_products(data)
+                for item in items:
+                    p = self._normalize_json_product(item)
+                    if p:
+                        products.append(p)
+                if products:
+                    return products
+            except json.JSONDecodeError:
+                pass
+
+        # Inline JSON
+        for script in soup.find_all("script"):
+            if not script.string:
+                continue
+            for pattern in [
+                r'"products"\s*:\s*(\[[\s\S]*?\])\s*[,}]',
+                r'"skus"\s*:\s*(\[[\s\S]*?\])\s*[,}]',
+                r'"items"\s*:\s*(\[[\s\S]*?\])\s*[,}]',
+            ]:
+                m = re.search(pattern, script.string)
+                if m:
+                    try:
+                        items = json.loads(m.group(1))
+                        for item in items:
+                            p = self._normalize_json_product(item)
+                            if p:
+                                products.append(p)
+                        if products:
+                            return products
+                    except json.JSONDecodeError:
+                        continue
+
+        # JSON-LD
+        for script in soup.find_all("script", {"type": "application/ld+json"}):
+            if not script.string:
+                continue
+            try:
+                ld = json.loads(script.string)
+                entries = ld if isinstance(ld, list) else [ld]
+                for item in entries:
+                    if item.get("@type") == "Product":
+                        p = self._normalize_jsonld(item)
+                        if p:
+                            products.append(p)
+            except json.JSONDecodeError:
+                continue
+
+        return products
+
+    def _dig_for_products(self, obj, depth: int = 0) -> list:
+        if depth > 15:
+            return []
+        if isinstance(obj, dict):
+            for key in ("products", "skus", "items", "searchResults", "results"):
+                if key in obj and isinstance(obj[key], list):
+                    return obj[key]
+            for v in obj.values():
+                r = self._dig_for_products(v, depth + 1)
+                if r:
+                    return r
+        elif isinstance(obj, list) and len(obj) > 0:
+            if isinstance(obj[0], dict) and any(
+                k in obj[0] for k in ("sku", "skuId", "productId", "name")
+            ):
+                return obj
+            for item in obj:
+                r = self._dig_for_products(item, depth + 1)
+                if r:
+                    return r
+        return []
+
+    def _normalize_json_product(self, item: dict) -> Optional[ScrapedProduct]:
+        if not isinstance(item, dict):
+            return None
+
+        # Price extraction
+        price = (
+            item.get("salePrice")
+            or item.get("currentPrice")
+            or item.get("price")
+            or item.get("priceAmount")
+        )
+        if isinstance(price, str):
+            price = self._parse_price(price)
+        if price is None:
+            pricing = item.get("pricing") or item.get("priceInfo") or {}
+            if isinstance(pricing, dict):
+                price = pricing.get("currentPrice") or pricing.get("price")
+                if isinstance(price, str):
+                    price = self._parse_price(price)
+
+        was_price = item.get("regularPrice") or item.get("wasPrice")
+        if isinstance(was_price, str):
+            was_price = self._parse_price(was_price)
+
+        title = (
+            item.get("name")
+            or item.get("title")
+            or item.get("productName")
+            or item.get("displayName")
+            or ""
+        )
+        if not title:
+            return None
+
+        sku = str(item.get("sku") or item.get("skuId") or item.get("productId") or "")
+
+        url = item.get("url") or item.get("pdpUrl") or item.get("canonicalUrl") or ""
+        if url and not url.startswith("http"):
+            url = urljoin(self.BASE_URL, url)
+
+        image = item.get("image") or item.get("imageUrl") or item.get("thumbnailImage") or ""
+        if isinstance(image, dict):
+            image = image.get("url") or image.get("src") or ""
+
+        # Rating
+        rating = item.get("customerReviewAverage") or item.get("rating")
+        reviews = item.get("customerReviewCount") or item.get("reviewCount") or 0
+        review_data = item.get("reviews") or item.get("customerReviews") or {}
+        if isinstance(review_data, dict):
+            rating = rating or review_data.get("averageRating") or review_data.get("average")
+            reviews = reviews or review_data.get("count") or review_data.get("total") or 0
+
+        on_sale = item.get("onSale", False)
+        savings = item.get("savings") or item.get("priceSavings")
+        savings_pct = item.get("percentSavings") or item.get("savingsPercent")
+
+        if not on_sale and was_price and price and was_price > price:
+            on_sale = True
+            savings = round(was_price - price, 2)
+            savings_pct = round((savings / was_price) * 100, 1)
+
+        # Open box
+        open_box = item.get("openBox") or item.get("openBoxPrice")
+        open_box_price = None
+        if isinstance(open_box, dict):
+            open_box_price = open_box.get("price") or open_box.get("lowPrice")
+        elif isinstance(open_box, (int, float)):
+            open_box_price = float(open_box)
+
+        return ScrapedProduct(
+            product_id=sku,
+            sku=sku,
+            model_number=str(item.get("modelNumber") or item.get("model") or ""),
+            upc=str(item.get("upc") or ""),
+            title=title.strip(),
+            brand=item.get("manufacturer") or item.get("brand") or item.get("brandName") or "",
+            description=item.get("shortDescription") or item.get("description") or "",
+            category=item.get("category") or item.get("categoryName") or "",
+            price=price,
+            was_price=was_price if on_sale else None,
+            sale_price=price if on_sale else None,
+            savings=savings,
+            savings_pct=savings_pct,
+            on_sale=on_sale,
+            rating=float(rating) if rating else None,
+            review_count=int(reviews) if reviews else 0,
+            url=url,
+            image_url=image,
+            in_store_available=item.get("inStoreAvailability"),
+            online_available=item.get("onlineAvailability"),
+            free_shipping=item.get("freeShipping", False),
+            pickup_available=item.get("inStorePickup"),
+            store_name="bestbuy",
+            badge=item.get("badge") or item.get("ribbonText") or "",
+            sponsored=item.get("sponsored", False),
+            condition=item.get("condition", "new"),
+            open_box_price=open_box_price,
+        )
+
+    def _normalize_jsonld(self, item: dict) -> Optional[ScrapedProduct]:
+        offers = item.get("offers", {})
+        if isinstance(offers, list):
+            offers = offers[0] if offers else {}
+
+        price = offers.get("price")
+        if isinstance(price, str):
+            price = self._parse_price(price)
+
+        brand = item.get("brand", "")
+        if isinstance(brand, dict):
+            brand = brand.get("name", "")
+
+        return ScrapedProduct(
+            product_id=item.get("sku", ""),
+            sku=item.get("sku", ""),
+            title=item.get("name", ""),
+            brand=brand,
+            price=price,
+            url=item.get("url", ""),
+            image_url=item.get("image", ""),
+            rating=(
+                float(item["aggregateRating"]["ratingValue"])
+                if "aggregateRating" in item
+                else None
+            ),
+            review_count=int(
+                item.get("aggregateRating", {}).get("reviewCount", 0)
+            ),
+            store_name="bestbuy",
+        )
+
+    # ── DOM parsing ──────────────────────────────────────────
+
+    def _parse_dom(self, html: str) -> list[ScrapedProduct]:
+        soup = BeautifulSoup(html, "lxml")
+        products: list[ScrapedProduct] = []
+
+        selectors = [
+            {"class_": "sku-item"},
+            {"attrs": {"data-testid": "sku-item"}},
+            {"class_": re.compile(r"list-item|product-item", re.I)},
+            {"class_": re.compile(r"sku-item-list", re.I)},
+        ]
+
+        cards = []
+        for sel in selectors:
+            cards = soup.find_all(["div", "li", "article"], **sel)
+            if cards:
+                break
+
+        for card in cards:
+            try:
+                p = self._parse_card(card)
+                if p and p.title:
+                    products.append(p)
+            except Exception:
+                continue
+
+        return products
+
+    def _parse_card(self, card) -> Optional[ScrapedProduct]:
+        data: dict = {}
+
+        # Title & link
+        title_el = (
+            card.find("h4", class_=re.compile(r"sku-title", re.I))
+            or card.find("h4", class_=re.compile(r"sku-header", re.I))
+            or card.find("a", class_=re.compile(r"sku-title", re.I))
+            or card.find("h4")
+            or card.find("h3")
+        )
+        if title_el:
+            link = title_el.find("a") if title_el.name != "a" else title_el
+            if link:
+                data["title"] = link.get_text(strip=True)
+                href = link.get("href", "")
+                data["url"] = href if href.startswith("http") else urljoin(self.BASE_URL, href)
+            else:
+                data["title"] = title_el.get_text(strip=True)
+
+        # Price
+        price_block = card.find(
+            "div", class_=re.compile(r"priceView|price-block", re.I)
+        )
+        if price_block:
+            current = price_block.find(
+                "span",
+                class_=re.compile(r"sr-only|priceView-hero-price", re.I),
+            )
+            if current:
+                data["price"] = self._parse_price(current.get_text())
+
+            # Was price
+            was = price_block.find(
+                "span",
+                class_=re.compile(r"pricing-price__regular-price|was-price", re.I),
+            )
+            if was:
+                data["was_price"] = self._parse_price(was.get_text())
+
+            # Savings
+            save_el = price_block.find(
+                "span", class_=re.compile(r"save|savings", re.I)
+            )
+            if save_el:
+                data["savings"] = self._parse_price(save_el.get_text())
+
+        # Rating
+        rating_el = card.find(attrs={"aria-label": re.compile(r"Rating|star", re.I)})
+        if rating_el:
+            label = rating_el.get("aria-label", "")
+            m = re.search(r"([\d.]+)\s*(?:out of|/)\s*5", label)
+            if m:
+                data["rating"] = float(m.group(1))
+        review_el = card.find(
+            "span", class_=re.compile(r"review-count|c-reviews", re.I)
+        )
+        if review_el:
+            m = re.search(r"\(?([\d,]+)\)?", review_el.get_text())
+            if m:
+                data["review_count"] = int(m.group(1).replace(",", ""))
+
+        # SKU
+        sku_el = card.find(
+            "span", class_=re.compile(r"sku-value|sku-id", re.I)
+        )
+        if sku_el:
+            data["sku"] = sku_el.get_text(strip=True)
+            data["product_id"] = data["sku"]
+
+        # Model
+        model_el = card.find(
+            "span", class_=re.compile(r"sku-model|model-value", re.I)
+        )
+        if model_el:
+            data["model_number"] = model_el.get_text(strip=True)
+
+        # Image
+        img = card.find("img")
+        if img:
+            data["image_url"] = img.get("src") or img.get("data-src") or ""
+
+        # Badge
+        badge_el = card.find(
+            "span", class_=re.compile(r"badge|ribbon|offer-text", re.I)
+        )
+        if badge_el:
+            data["badge"] = badge_el.get_text(strip=True)
+
+        # Open box
+        ob_el = card.find(string=re.compile(r"open.?box", re.I))
+        if ob_el:
+            parent = ob_el.find_parent()
+            if parent:
+                price_m = re.search(r"\$([\d,.]+)", parent.get_text())
+                if price_m:
+                    data["open_box_price"] = float(price_m.group(1).replace(",", ""))
+
+        # Sale detection
+        if data.get("was_price") and data.get("price"):
+            if data["was_price"] > data["price"]:
+                data["on_sale"] = True
+                data["savings"] = round(data["was_price"] - data["price"], 2)
+                data["savings_pct"] = round(
+                    (data["savings"] / data["was_price"]) * 100, 1
+                )
+
+        # Sponsored
+        if card.find(string=re.compile(r"sponsored", re.I)):
+            data["sponsored"] = True
+
+        if not data.get("title"):
+            return None
+
+        data["store_name"] = "bestbuy"
+        return ScrapedProduct(**{k: v for k, v in data.items() if k in ScrapedProduct.__dataclass_fields__})
+
+    # ── Product detail ───────────────────────────────────────
+
+    async def get_product_details(self, product_id: str) -> Optional[ScrapedProduct]:
+        # API path
+        if self.api_key:
+            return self._get_detail_api(product_id)
+
+        # Scrape path
+        url = f"{self.BASE_URL}/site/searchpage.jsp?st={product_id}"
+        try:
+            if self.use_browser:
+                html = await self._fetch_browser(url)
+            else:
+                html = self._fetch_static(url)
+        except Exception:
+            return None
+
+        products = self._parse_search_page(html)
+        for p in products:
+            if p.sku == product_id or p.product_id == product_id:
+                return p
+        return products[0] if products else None
+
+    def _get_detail_api(self, sku: str) -> Optional[ScrapedProduct]:
+        params = {
+            "apiKey": self.api_key,
+            "format": "json",
+            "show": (
+                "sku,name,salePrice,regularPrice,onSale,savings,percentSavings,"
+                "customerReviewAverage,customerReviewCount,url,image,"
+                "manufacturer,modelNumber,upc,categoryPath,freeShipping,"
+                "inStoreAvailability,onlineAvailability,inStorePickup,"
+                "shortDescription,longDescription,condition,openBoxPrice,"
+                "bestBuyItemId"
+            ),
+        }
+        url = f"{self.API_BASE}/products/{sku}.json"
+        try:
+            resp = requests.get(url, params=params, timeout=10)
+            resp.raise_for_status()
+            return self._normalize_api_product(resp.json())
+        except Exception:
+            return None
+
+    # ── UPC search ───────────────────────────────────────────
+
+    async def search_by_upc(self, upc: str) -> Optional[ScrapedProduct]:
+        if self.api_key:
+            params = {
+                "apiKey": self.api_key,
+                "format": "json",
+                "show": "all",
+            }
+            url = f"{self.API_BASE}/products(upc={upc})"
+            try:
+                resp = requests.get(url, params=params, timeout=10)
+                resp.raise_for_status()
+                products = resp.json().get("products", [])
+                if products:
+                    return self._normalize_api_product(products[0])
+            except Exception:
+                pass
+
+        # Fallback to regular search
+        results = await self.search(upc)
+        return results[0] if results else None
+
+    # ── Helpers ──────────────────────────────────────────────
+
+    @staticmethod
+    def _parse_price(text: str) -> Optional[float]:
+        if not text:
+            return None
+        text = text.replace(",", "").replace("$", "").strip()
+        m = re.search(r"(\d+\.?\d*)", text)
+        if m:
+            try:
+                return float(m.group(1))
+            except ValueError:
+                return None
+        return None
+```
+
+---
+
+## 14. `scrapers/registry.py`
+
+```python
+"""
+Scraper registry – central place to register all store scrapers.
+Adding a new store is as simple as creating a scraper class and registering it.
+"""
+
+from typing import Optional
+
+from scrapers.base import BaseScraper
+
+
+class ScraperRegistry:
+    """Registry of all available store scrapers."""
+
+    def __init__(self):
+        self._scrapers: dict[str, BaseScraper] = {}
+
+    def register(self, name: str, scraper: BaseScraper):
+        self._scrapers[name.lower()] = scraper
+
+    def get(self, name: str) -> Optional[BaseScraper]:
+        return self._scrapers.get(name.lower())
+
+    def get_all(self) -> dict[str, BaseScraper]:
+        return dict(self._scrapers)
+
+    def list_stores(self) -> list[str]:
+        return list(self._scrapers.keys())
+
+    async def search_all(self, query: str, stores: Optional[list[str]] = None) -> dict[str, list]:
+        """Search across multiple stores simultaneously."""
+        import asyncio
+
+        targets = stores or list(self._scrapers.keys())
+        results: dict[str, list] = {}
+
+        async def _search_store(name: str):
+            scraper = self._scrapers.get(name)
+            if scraper:
+                try:
+                    products = await scraper.search(query)
+                    results[name] = products
+                except Exception as e:
+                    results[name] = []
+                    print(f"[registry] {name} search failed: {e}")
+
+        await asyncio.gather(*[_search_store(s) for s in targets])
+        return results
+
+    async def close_all(self):
+        for scraper in self._scrapers.values():
+            await scraper.close()
+```
+
+---
+
+## 15. `analysis/deal_analyzer.py`
+
+```python
+"""
+Best Buy deal analyzer – scores
