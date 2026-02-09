@@ -1,0 +1,2470 @@
+
+
+# AI-Powered Walmart Price Finder with Ollama
+
+Complete Python tool that uses local Ollama AI to understand product queries (text, description, or image), search Walmart, verify results with AI, and find the best price.
+
+---
+
+## Project Structure
+
+```
+walmart_price_finder/
+├── .env
+├── config.py
+├── main.py
+├── ai_engine.py
+├── walmart_scraper.py
+├── walmart_api.py
+├── product_verifier.py
+├── result_formatter.py
+├── deal_analyzer.py
+├── price_history.py
+├── requirements.txt
+├── cache/
+└── data/
+    └── price_history.db
+```
+
+---
+
+## 1. `requirements.txt`
+
+```txt
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+lxml>=5.1.0
+python-dotenv>=1.0.0
+rich>=13.7.0
+httpx>=0.27.0
+fake-useragent>=1.5.0
+Pillow>=10.0.0
+playwright>=1.44.0
+```
+
+> **Note:** After `pip install`, run `playwright install chromium` for dynamic page rendering.
+
+---
+
+## 2. `.env`
+
+```env
+# ============================================
+# Ollama Configuration
+# ============================================
+
+OLLAMA_BASE_URL=http://localhost:11434
+
+# Text model (7B or smaller):
+#   llama3.2:3b, mistral:7b, phi3:3.8b, gemma2:2b, qwen2.5:7b
+OLLAMA_TEXT_MODEL=llama3.2:3b
+
+# Vision model for image input:
+#   llava:7b, llava-llama3:8b, moondream:1.8b, bakllava:7b
+OLLAMA_VISION_MODEL=llava:7b
+
+# ============================================
+# Walmart Search Settings  
+# ============================================
+
+# Search method: scrape | api
+# scrape = parse walmart.com HTML (no key needed)
+# api    = Walmart Affiliate API (needs credentials)
+WALMART_SEARCH_METHOD=scrape
+
+# Walmart Affiliate API credentials (optional, for api method)
+# Apply at: https://affiliates.walmart.com/
+WALMART_API_KEY=
+WALMART_AFFILIATE_ID=
+
+# Max pages to search
+MAX_PAGES=3
+
+# Max results to analyze per query
+MAX_RESULTS=25
+
+# Request delay (seconds) — be respectful
+REQUEST_DELAY=2.5
+
+# Use Playwright browser for JS-rendered content
+# Set to true if scraping returns empty results
+USE_BROWSER=true
+
+# ============================================
+# AI Verification
+# ============================================
+
+# Minimum confidence (0-100) for AI to consider a match
+MIN_MATCH_CONFIDENCE=70
+
+# Strictness: strict | moderate | loose
+VERIFICATION_MODE=moderate
+
+# ============================================
+# Price History Tracking
+# ============================================
+
+# Track prices over time in local SQLite DB
+ENABLE_PRICE_HISTORY=true
+
+# Alert if price drops below this % of last seen price
+PRICE_DROP_ALERT_PCT=5.0
+
+# ============================================
+# Deal Analysis
+# ============================================
+
+# Check for Walmart+ exclusive pricing
+CHECK_WALMART_PLUS=true
+
+# Include marketplace (third-party) sellers
+INCLUDE_MARKETPLACE=true
+
+# Flag items fulfilled by Walmart vs third-party
+FLAG_FULFILLMENT=true
+```
+
+---
+
+## 3. `config.py`
+
+```python
+import os
+from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv()
+
+BASE_DIR = Path(__file__).resolve().parent
+
+
+class Config:
+    # Ollama
+    OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+    OLLAMA_TEXT_MODEL = os.getenv("OLLAMA_TEXT_MODEL", "llama3.2:3b")
+    OLLAMA_VISION_MODEL = os.getenv("OLLAMA_VISION_MODEL", "llava:7b")
+
+    # Walmart
+    WALMART_SEARCH_METHOD = os.getenv("WALMART_SEARCH_METHOD", "scrape")
+    WALMART_API_KEY = os.getenv("WALMART_API_KEY", "")
+    WALMART_AFFILIATE_ID = os.getenv("WALMART_AFFILIATE_ID", "")
+
+    # Scraping
+    MAX_PAGES = int(os.getenv("MAX_PAGES", "3"))
+    MAX_RESULTS = int(os.getenv("MAX_RESULTS", "25"))
+    REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "2.5"))
+    USE_BROWSER = os.getenv("USE_BROWSER", "true").lower() == "true"
+
+    # Verification
+    MIN_MATCH_CONFIDENCE = int(os.getenv("MIN_MATCH_CONFIDENCE", "70"))
+    VERIFICATION_MODE = os.getenv("VERIFICATION_MODE", "moderate")
+
+    # Price History
+    ENABLE_PRICE_HISTORY = os.getenv("ENABLE_PRICE_HISTORY", "true").lower() == "true"
+    PRICE_DROP_ALERT_PCT = float(os.getenv("PRICE_DROP_ALERT_PCT", "5.0"))
+
+    # Deals
+    CHECK_WALMART_PLUS = os.getenv("CHECK_WALMART_PLUS", "true").lower() == "true"
+    INCLUDE_MARKETPLACE = os.getenv("INCLUDE_MARKETPLACE", "true").lower() == "true"
+    FLAG_FULFILLMENT = os.getenv("FLAG_FULFILLMENT", "true").lower() == "true"
+
+    # Paths
+    DATA_DIR = BASE_DIR / "data"
+    CACHE_DIR = BASE_DIR / "cache"
+    DB_PATH = DATA_DIR / "price_history.db"
+
+    @classmethod
+    def ensure_dirs(cls):
+        cls.DATA_DIR.mkdir(exist_ok=True)
+        cls.CACHE_DIR.mkdir(exist_ok=True)
+```
+
+---
+
+## 4. `ai_engine.py`
+
+```python
+"""
+AI Engine — Ollama interface for:
+1. Understanding user queries (text / image)
+2. Generating optimal Walmart search terms
+3. Verifying product matches
+4. Ranking results and making recommendations
+"""
+
+import json
+import base64
+import re
+import io
+from pathlib import Path
+
+import httpx
+from PIL import Image
+
+from config import Config
+
+
+class AIEngine:
+
+    def __init__(self):
+        self.base_url = Config.OLLAMA_BASE_URL
+        self.text_model = Config.OLLAMA_TEXT_MODEL
+        self.vision_model = Config.OLLAMA_VISION_MODEL
+        self.client = httpx.Client(timeout=120.0)
+        self._verify_ollama()
+
+    # ------------------------------------------------------------------
+    # CONNECTION
+    # ------------------------------------------------------------------
+
+    def _verify_ollama(self):
+        try:
+            resp = self.client.get(f"{self.base_url}/api/tags")
+            resp.raise_for_status()
+            available = [m["name"] for m in resp.json().get("models", [])]
+
+            text_ok = any(
+                self.text_model in m or m.startswith(self.text_model.split(":")[0])
+                for m in available
+            )
+            if not text_ok:
+                print(f"⚠️  Text model '{self.text_model}' not found.")
+                print(f"   Run: ollama pull {self.text_model}")
+                print(f"   Available: {', '.join(available[:10])}")
+
+            print(f"✅ Ollama connected | Text: {self.text_model}")
+        except Exception as e:
+            print(f"❌ Cannot connect to Ollama at {self.base_url}")
+            print(f"   Error: {e}")
+            print(f"   Start Ollama: ollama serve")
+            raise SystemExit(1)
+
+    def _chat(
+        self,
+        model: str,
+        prompt: str,
+        images: list = None,
+        system: str = "",
+        temperature: float = 0.1,
+        max_tokens: int = 1024,
+    ) -> str:
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        user_msg = {"role": "user", "content": prompt}
+        if images:
+            user_msg["images"] = images
+        messages.append(user_msg)
+
+        try:
+            resp = self.client.post(
+                f"{self.base_url}/api/chat",
+                json={
+                    "model": model,
+                    "messages": messages,
+                    "stream": False,
+                    "options": {
+                        "temperature": temperature,
+                        "num_predict": max_tokens,
+                    },
+                },
+            )
+            resp.raise_for_status()
+            return resp.json()["message"]["content"].strip()
+        except httpx.TimeoutException:
+            print("⏳ AI timeout, retrying with shorter output…")
+            resp = self.client.post(
+                f"{self.base_url}/api/chat",
+                json={
+                    "model": model,
+                    "messages": messages,
+                    "stream": False,
+                    "options": {"temperature": temperature, "num_predict": 512},
+                },
+                timeout=180.0,
+            )
+            resp.raise_for_status()
+            return resp.json()["message"]["content"].strip()
+
+    # ------------------------------------------------------------------
+    # IMAGE ENCODING
+    # ------------------------------------------------------------------
+
+    def _encode_image(self, image_path: str) -> str:
+        path = Path(image_path)
+        if not path.exists():
+            raise FileNotFoundError(f"Image not found: {image_path}")
+
+        img = Image.open(path)
+        max_dim = 1024
+        if max(img.size) > max_dim:
+            ratio = max_dim / max(img.size)
+            img = img.resize(
+                (int(img.size[0] * ratio), int(img.size[1] * ratio)),
+                Image.LANCZOS,
+            )
+        if img.mode in ("RGBA", "P", "LA"):
+            img = img.convert("RGB")
+
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=85)
+        return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+    # ------------------------------------------------------------------
+    # 1. UNDERSTAND QUERY
+    # ------------------------------------------------------------------
+
+    def understand_query(self, user_input: str, image_path: str = None) -> dict:
+        if image_path:
+            return self._understand_from_image(image_path, user_input)
+        return self._understand_from_text(user_input)
+
+    def _understand_from_text(self, user_input: str) -> dict:
+        system = (
+            "You are a product identification expert. "
+            "Extract structured product info from user queries. "
+            "Respond ONLY with valid JSON, no extra text."
+        )
+        prompt = f"""The user wants to find this product on Walmart:
+"{user_input}"
+
+Extract the product details and generate Walmart search queries.
+Respond with ONLY this JSON:
+
+{{
+    "product_name": "full product name as best you can determine",
+    "brand": "brand name or empty string",
+    "model": "model number/name or empty string",
+    "category": "general product category",
+    "key_features": ["important", "features", "mentioned"],
+    "walmart_department": "best matching Walmart department (Electronics, Home, Tools, Sports, Auto, etc)",
+    "search_queries": [
+        "most specific walmart search query",
+        "slightly broader query",
+        "broadest fallback query"
+    ],
+    "price_range_hint": "expected price range like $50-$150 or empty string"
+}}
+
+Rules:
+- search_queries should work well on walmart.com search
+- First query = most specific (brand + model + details)
+- Second query = brand + product type + key feature
+- Third query = general product type
+- walmart_department should match Walmart's actual department names
+- price_range_hint helps filter unrealistic results"""
+
+        response = self._chat(self.text_model, prompt, system=system)
+        return self._parse_json_response(response, user_input)
+
+    def _understand_from_image(self, image_path: str, additional_text: str = "") -> dict:
+        print(f"🖼️  Analyzing image: {image_path}")
+        image_b64 = self._encode_image(image_path)
+
+        prompt = f"""Look at this product image carefully.
+
+Identify:
+1. What product is this?
+2. What brand?
+3. What model/version?
+4. Key visible features?
+
+{f'Additional context: "{additional_text}"' if additional_text else ''}
+
+Respond with ONLY this JSON:
+
+{{
+    "product_name": "full product name",
+    "brand": "brand name",
+    "model": "model number/name",
+    "category": "product category",
+    "key_features": ["feature1", "feature2"],
+    "walmart_department": "best matching Walmart department",
+    "search_queries": [
+        "most specific walmart search query",
+        "broader search query",
+        "broadest fallback query"
+    ],
+    "price_range_hint": "estimated price range"
+}}"""
+
+        response = self._chat(self.vision_model, prompt, images=[image_b64])
+        original = additional_text or f"[Image: {image_path}]"
+        return self._parse_json_response(response, original)
+
+    # ------------------------------------------------------------------
+    # 2. VERIFY PRODUCT MATCH
+    # ------------------------------------------------------------------
+
+    def verify_product_match(self, wanted: dict, candidate: dict) -> dict:
+        system = (
+            "You are a product matching expert. Compare products precisely. "
+            "Respond with valid JSON only."
+        )
+
+        prompt = f"""Compare these two products and determine if they match.
+
+WANTED PRODUCT (what the user is looking for):
+- Name: {wanted.get('product_name', 'Unknown')}
+- Brand: {wanted.get('brand', 'Unknown')}
+- Model: {wanted.get('model', 'Unknown')}
+- Category: {wanted.get('category', 'Unknown')}
+- Key Features: {', '.join(wanted.get('key_features', []))}
+- Original Query: {wanted.get('original_input', '')}
+
+FOUND PRODUCT (from Walmart):
+- Title: {candidate.get('title', 'Unknown')}
+- Price: {candidate.get('price_display', 'Unknown')}
+- Brand on listing: {candidate.get('brand', 'Unknown')}
+- Seller: {candidate.get('seller', 'Unknown')}
+- Fulfillment: {candidate.get('fulfillment', 'Unknown')}
+- Product ID: {candidate.get('product_id', 'Unknown')}
+
+Verification mode: {Config.VERIFICATION_MODE}
+
+Modes:
+- strict: Brand AND model must match. Same specific product.
+- moderate: Same brand AND product type. Model very similar.
+- loose: Same product category. Brand preferred but not required.
+
+IMPORTANT for Walmart: Watch for:
+- "Restored" or "Refurbished" items (flag them)
+- Marketplace vs Walmart-sold items
+- Bundle vs single item differences
+- Different sizes/capacities of same product
+
+Respond with ONLY this JSON:
+
+{{
+    "is_match": true/false,
+    "confidence": 0-100,
+    "reasoning": "brief explanation",
+    "match_type": "exact|close|partial|no_match",
+    "concerns": ["any issues"],
+    "is_refurbished": true/false,
+    "is_bundle": true/false
+}}"""
+
+        response = self._chat(self.text_model, prompt, system=system)
+
+        try:
+            result = self._extract_json(response)
+            result["confidence"] = int(result.get("confidence", 0))
+            result["is_match"] = bool(result.get("is_match", False))
+            result.setdefault("is_refurbished", False)
+            result.setdefault("is_bundle", False)
+            return result
+        except Exception:
+            return {
+                "is_match": False,
+                "confidence": 0,
+                "reasoning": "AI response parse failure",
+                "match_type": "no_match",
+                "concerns": ["parse error"],
+                "is_refurbished": False,
+                "is_bundle": False,
+            }
+
+    # ------------------------------------------------------------------
+    # 3. RANK AND RECOMMEND
+    # ------------------------------------------------------------------
+
+    def rank_results(self, wanted: dict, verified: list) -> str:
+        if not verified:
+            return "No verified matching products found."
+
+        products_text = ""
+        for i, p in enumerate(verified[:10], 1):
+            line = (
+                f"\n{i}. {p['title']}"
+                f"\n   Price: {p['price_display']}"
+                f"\n   Rating: {p.get('rating', 'N/A')} ({p.get('review_count', 'N/A')} reviews)"
+                f"\n   Match Confidence: {p.get('match_confidence', 'N/A')}%"
+                f"\n   Seller: {p.get('seller', 'N/A')}"
+                f"\n   Fulfillment: {p.get('fulfillment', 'N/A')}"
+                f"\n   Walmart+: {'Yes' if p.get('walmart_plus_price') else 'No'}"
+            )
+            if p.get("is_refurbished"):
+                line += "\n   ⚠️  REFURBISHED/RESTORED"
+            if p.get("rollback"):
+                line += "\n   🔴 ROLLBACK PRICE"
+            products_text += line + "\n"
+
+        prompt = f"""The user wanted: "{wanted.get('original_input', wanted.get('product_name', ''))}"
+
+Verified matching products found on Walmart:
+{products_text}
+
+Give a brief, helpful recommendation:
+1. Which is the BEST DEAL and why?
+2. Walmart-sold vs marketplace seller considerations?
+3. Any refurbished/restored items to be aware of?
+4. Walmart+ pricing advantages?
+5. A one-line verdict.
+
+Keep it concise and practical."""
+
+        return self._chat(self.text_model, prompt)
+
+    # ------------------------------------------------------------------
+    # HELPERS
+    # ------------------------------------------------------------------
+
+    def _parse_json_response(self, response: str, original_input: str) -> dict:
+        try:
+            data = self._extract_json(response)
+            data["original_input"] = original_input
+            data.setdefault("product_name", original_input)
+            data.setdefault("brand", "")
+            data.setdefault("model", "")
+            data.setdefault("category", "")
+            data.setdefault("key_features", [])
+            data.setdefault("walmart_department", "")
+            data.setdefault("search_queries", [original_input])
+            data.setdefault("price_range_hint", "")
+            if not data["search_queries"]:
+                data["search_queries"] = [original_input]
+            return data
+        except Exception as e:
+            print(f"⚠️  AI parsing failed, using raw input. ({e})")
+            return {
+                "product_name": original_input,
+                "brand": "",
+                "model": "",
+                "category": "",
+                "key_features": [],
+                "walmart_department": "",
+                "search_queries": [original_input],
+                "price_range_hint": "",
+                "original_input": original_input,
+            }
+
+    def _extract_json(self, text: str) -> dict:
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            pass
+        for pattern in [r"```json\s*(.*?)\s*```", r"```\s*(.*?)\s*```", r"(\{.*\})"]:
+            match = re.search(pattern, text, re.DOTALL)
+            if match:
+                try:
+                    return json.loads(match.group(1))
+                except json.JSONDecodeError:
+                    continue
+        raise ValueError(f"No valid JSON in: {text[:200]}")
+```
+
+---
+
+## 5. `walmart_scraper.py`
+
+```python
+"""
+Walmart Scraper — Searches walmart.com and extracts product listings.
+Supports both static requests and Playwright browser rendering.
+"""
+
+import re
+import json
+import time
+import random
+from urllib.parse import urlencode, quote_plus
+
+import requests
+from bs4 import BeautifulSoup
+from fake_useragent import UserAgent
+
+from config import Config
+
+
+class WalmartScraper:
+
+    def __init__(self):
+        self.max_pages = Config.MAX_PAGES
+        self.max_results = Config.MAX_RESULTS
+        self.delay = Config.REQUEST_DELAY
+        self.use_browser = Config.USE_BROWSER
+        self.ua = UserAgent(
+            fallback=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/125.0.0.0 Safari/537.36"
+            )
+        )
+        self.session = requests.Session()
+        self._browser = None
+        self._browser_context = None
+
+    # ------------------------------------------------------------------
+    # BROWSER MANAGEMENT (Playwright)
+    # ------------------------------------------------------------------
+
+    def _get_browser(self):
+        """Lazy-init Playwright browser."""
+        if self._browser is None:
+            try:
+                from playwright.sync_api import sync_playwright
+                self._playwright = sync_playwright().start()
+                self._browser = self._playwright.chromium.launch(
+                    headless=True,
+                    args=[
+                        "--disable-blink-features=AutomationControlled",
+                        "--no-sandbox",
+                    ],
+                )
+                self._browser_context = self._browser.new_context(
+                    user_agent=self.ua.random,
+                    viewport={"width": 1920, "height": 1080},
+                    locale="en-US",
+                )
+            except ImportError:
+                print("⚠️  Playwright not installed. Run: pip install playwright && playwright install chromium")
+                print("   Falling back to requests-only mode.")
+                self.use_browser = False
+                return None
+            except Exception as e:
+                print(f"⚠️  Browser launch failed: {e}")
+                print("   Run: playwright install chromium")
+                self.use_browser = False
+                return None
+        return self._browser_context
+
+    def close(self):
+        """Clean up browser resources."""
+        if self._browser_context:
+            self._browser_context.close()
+        if self._browser:
+            self._browser.close()
+        if hasattr(self, "_playwright") and self._playwright:
+            self._playwright.stop()
+
+    # ------------------------------------------------------------------
+    # HEADERS
+    # ------------------------------------------------------------------
+
+    def _get_headers(self) -> dict:
+        return {
+            "User-Agent": self.ua.random,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "DNT": "1",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+        }
+
+    def _respectful_delay(self):
+        time.sleep(self.delay + random.uniform(0.5, 2.5))
+
+    # ------------------------------------------------------------------
+    # SEARCH
+    # ------------------------------------------------------------------
+
+    def search(self, query: str, sort: str = "best_match", page: int = 1) -> list:
+        """
+        Search Walmart for products.
+        sort: best_match | price_low | price_high | best_seller | rating_high
+        """
+        sort_map = {
+            "best_match": "best_match",
+            "price_low": "price_low",
+            "price_high": "price_high",
+            "best_seller": "best_seller",
+            "rating_high": "rating_high",
+        }
+
+        all_products = []
+
+        for pg in range(page, page + self.max_pages):
+            print(f"   📄 Scraping page {pg}/{page + self.max_pages - 1} for: '{query}'")
+
+            params = {
+                "q": query,
+                "sort": sort_map.get(sort, "best_match"),
+                "page": pg,
+                "affinityOverride": "default",
+            }
+
+            url = f"https://www.walmart.com/search?{urlencode(params)}"
+
+            try:
+                self._respectful_delay()
+                html = self._fetch_page(url)
+
+                if not html:
+                    print(f"   ⚠️  Empty response on page {pg}")
+                    continue
+
+                products = self._parse_search_page(html)
+                all_products.extend(products)
+
+                print(f"   ✅ Found {len(products)} products on page {pg}")
+
+                if len(all_products) >= self.max_results:
+                    break
+                if not products:
+                    break
+
+            except Exception as e:
+                print(f"   ❌ Error on page {pg}: {e}")
+                continue
+
+        # Deduplicate
+        seen = set()
+        unique = []
+        for p in all_products:
+            pid = p.get("product_id", p.get("title", ""))
+            if pid not in seen:
+                seen.add(pid)
+                unique.append(p)
+
+        return unique[: self.max_results]
+
+    def search_multiple_queries(self, queries: list) -> list:
+        all_products = []
+        seen_ids = set()
+
+        for i, query in enumerate(queries):
+            print(f"\n🔎 Search query {i + 1}/{len(queries)}: '{query}'")
+            results = self.search(query)
+
+            for product in results:
+                pid = product.get("product_id", product.get("title", ""))
+                if pid not in seen_ids:
+                    seen_ids.add(pid)
+                    product["found_by_query"] = query
+                    all_products.append(product)
+
+        print(f"\n📊 Total unique products found: {len(all_products)}")
+        return all_products
+
+    # ------------------------------------------------------------------
+    # FETCH PAGE
+    # ------------------------------------------------------------------
+
+    def _fetch_page(self, url: str) -> str:
+        """Fetch page HTML using browser or requests."""
+
+        if self.use_browser:
+            return self._fetch_with_browser(url)
+        return self._fetch_with_requests(url)
+
+    def _fetch_with_requests(self, url: str) -> str:
+        resp = self.session.get(url, headers=self._get_headers(), timeout=15)
+        if resp.status_code == 429:
+            print("   ⚠️  Rate limited. Waiting 30s…")
+            time.sleep(30)
+            resp = self.session.get(url, headers=self._get_headers(), timeout=15)
+        if resp.status_code != 200:
+            print(f"   ⚠️  Status {resp.status_code}")
+            return ""
+        return resp.text
+
+    def _fetch_with_browser(self, url: str) -> str:
+        ctx = self._get_browser()
+        if not ctx:
+            return self._fetch_with_requests(url)
+
+        try:
+            page = ctx.new_page()
+
+            # Block images/fonts/css for speed
+            page.route(
+                "**/*.{png,jpg,jpeg,gif,svg,webp,woff,woff2,ttf,css}",
+                lambda route: route.abort(),
+            )
+
+            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+
+            # Wait for product grid to render
+            try:
+                page.wait_for_selector(
+                    '[data-testid="list-view"], [data-item-id], .search-result-gridview-item',
+                    timeout=10000,
+                )
+            except Exception:
+                # Fallback: wait for any product-ish element
+                time.sleep(3)
+
+            # Scroll down to trigger lazy loading
+            for _ in range(3):
+                page.evaluate("window.scrollBy(0, 800)")
+                time.sleep(0.5)
+
+            html = page.content()
+            page.close()
+            return html
+
+        except Exception as e:
+            print(f"   ⚠️  Browser fetch failed: {e}")
+            try:
+                page.close()
+            except Exception:
+                pass
+            return self._fetch_with_requests(url)
+
+    # ------------------------------------------------------------------
+    # PARSE SEARCH RESULTS
+    # ------------------------------------------------------------------
+
+    def _parse_search_page(self, html: str) -> list:
+        """Parse Walmart search results — tries JSON-LD first, then HTML."""
+
+        products = []
+
+        # Method 1: Extract from __NEXT_DATA__ JSON (most reliable)
+        products = self._extract_from_next_data(html)
+        if products:
+            return products
+
+        # Method 2: Extract from inline script JSON
+        products = self._extract_from_script_json(html)
+        if products:
+            return products
+
+        # Method 3: Parse HTML directly
+        products = self._extract_from_html(html)
+        return products
+
+    def _extract_from_next_data(self, html: str) -> list:
+        """Extract product data from Next.js __NEXT_DATA__ script."""
+        products = []
+
+        try:
+            soup = BeautifulSoup(html, "lxml")
+            script = soup.find("script", {"id": "__NEXT_DATA__"})
+
+            if not script or not script.string:
+                return []
+
+            data = json.loads(script.string)
+
+            # Navigate the nested structure
+            page_props = data.get("props", {}).get("pageProps", {})
+            initial_data = page_props.get("initialData", {})
+            search_result = initial_data.get("searchResult", {})
+            item_stacks = search_result.get("itemStacks", [])
+
+            for stack in item_stacks:
+                items = stack.get("items", [])
+                for item in items:
+                    product = self._parse_next_data_item(item)
+                    if product:
+                        products.append(product)
+
+        except (json.JSONDecodeError, KeyError, TypeError):
+            pass
+
+        return products
+
+    def _parse_next_data_item(self, item: dict) -> dict | None:
+        """Parse a single item from __NEXT_DATA__."""
+        if not item or item.get("__typename") == "AdPlaceholder":
+            return None
+
+        title = item.get("name", "")
+        if not title:
+            return None
+
+        product_id = item.get("usItemId", item.get("id", ""))
+
+        # Price extraction
+        price_info = item.get("priceInfo", {})
+        current_price = price_info.get("currentPrice", {})
+        was_price = price_info.get("wasPrice", {})
+        unit_price = price_info.get("unitPrice", {})
+
+        price = 0.0
+        if current_price:
+            price = current_price.get("price", 0.0)
+            if not price:
+                price_str = current_price.get("priceString", "")
+                price = self._parse_price_text(price_str)
+
+        if not price or price <= 0:
+            return None
+
+        original_price = 0.0
+        if was_price:
+            original_price = was_price.get("price", 0.0)
+            if not original_price:
+                original_price = self._parse_price_text(
+                    was_price.get("priceString", "")
+                )
+
+        # Walmart+ price
+        walmart_plus_price = None
+        member_price = price_info.get("memberPrice", {})
+        if member_price:
+            walmart_plus_price = member_price.get("price", None)
+
+        # Rating
+        rating_info = item.get("rating", {})
+        rating = rating_info.get("averageRating", 0.0) if isinstance(rating_info, dict) else 0.0
+        review_count = rating_info.get("numberOfReviews", 0) if isinstance(rating_info, dict) else 0
+
+        # Seller / fulfillment
+        seller_name = item.get("sellerName", "")
+        fulfillment = self._determine_fulfillment(item)
+
+        # Flags
+        badges = item.get("badges", {})
+        is_rollback = False
+        is_reduced = False
+        badge_text = ""
+
+        if isinstance(badges, dict):
+            flags = badges.get("flags", [])
+            for flag in flags:
+                flag_text = ""
+                if isinstance(flag, dict):
+                    flag_text = flag.get("text", "").lower()
+                    badge_text = flag.get("text", "")
+                elif isinstance(flag, str):
+                    flag_text = flag.lower()
+                    badge_text = flag
+
+                if "rollback" in flag_text:
+                    is_rollback = True
+                if "reduced" in flag_text:
+                    is_reduced = True
+
+        is_sponsored = item.get("isSponsoredFlag", False)
+
+        # Image
+        image_url = ""
+        image_info = item.get("imageInfo", {})
+        if isinstance(image_info, dict):
+            image_url = image_info.get("thumbnailUrl", "")
+
+        return {
+            "product_id": str(product_id),
+            "title": title,
+            "brand": item.get("brand", ""),
+            "price": float(price),
+            "price_display": f"${float(price):.2f}",
+            "original_price": float(original_price) if original_price else 0.0,
+            "walmart_plus_price": float(walmart_plus_price) if walmart_plus_price else None,
+            "rating": float(rating) if rating else 0.0,
+            "review_count": int(review_count) if review_count else 0,
+            "seller": seller_name or "Walmart.com",
+            "fulfillment": fulfillment,
+            "is_rollback": is_rollback,
+            "is_reduced": is_reduced,
+            "is_sponsored": is_sponsored,
+            "badge": badge_text,
+            "image_url": image_url,
+            "url": f"https://www.walmart.com/ip/{product_id}" if product_id else "",
+            "is_marketplace": seller_name.lower() not in ("", "walmart.com", "walmart"),
+        }
+
+    def _determine_fulfillment(self, item: dict) -> str:
+        """Determine fulfillment type from item data."""
+        fulfillment = item.get("fulfillmentBadge", "")
+        if fulfillment:
+            return fulfillment
+
+        offer = item.get("fulfillmentType", "")
+        if offer:
+            return offer
+
+        badges = item.get("fulfillmentBadges", [])
+        if badges:
+            return ", ".join(str(b) for b in badges[:2])
+
+        shipping = item.get("shippingOption", {})
+        if isinstance(shipping, dict):
+            return shipping.get("fulfillmentType", "Standard")
+
+        return "Standard"
+
+    def _extract_from_script_json(self, html: str) -> list:
+        """Fallback: extract from other inline JSON scripts."""
+        products = []
+
+        try:
+            pattern = r'"itemStacks"\s*:\s*(\[.*?\])\s*[,}]'
+            match = re.search(pattern, html, re.DOTALL)
+            if not match:
+                return []
+
+            stacks = json.loads(match.group(1))
+            for stack in stacks:
+                if isinstance(stack, dict):
+                    for item in stack.get("items", []):
+                        product = self._parse_next_data_item(item)
+                        if product:
+                            products.append(product)
+        except Exception:
+            pass
+
+        return products
+
+    def _extract_from_html(self, html: str) -> list:
+        """Last resort: parse raw HTML structure."""
+        products = []
+        soup = BeautifulSoup(html, "lxml")
+
+        # Walmart uses data-item-id on product cards
+        cards = soup.select("[data-item-id]")
+
+        if not cards:
+            # Try alternative selectors
+            cards = soup.select(
+                '[data-testid="list-view"] > div, '
+                ".search-result-gridview-item, "
+                '[class*="product-card"]'
+            )
+
+        for card in cards:
+            try:
+                product = self._parse_html_card(card)
+                if product and product.get("price", 0) > 0:
+                    products.append(product)
+            except Exception:
+                continue
+
+        return products
+
+    def _parse_html_card(self, card) -> dict | None:
+        """Parse a single product card from HTML."""
+        product = {
+            "product_id": card.get("data-item-id", ""),
+            "title": "",
+            "brand": "",
+            "price": 0.0,
+            "price_display": "",
+            "original_price": 0.0,
+            "walmart_plus_price": None,
+            "rating": 0.0,
+            "review_count": 0,
+            "seller": "Walmart.com",
+            "fulfillment": "Standard",
+            "is_rollback": False,
+            "is_reduced": False,
+            "is_sponsored": False,
+            "badge": "",
+            "image_url": "",
+            "url": "",
+            "is_marketplace": False,
+        }
+
+        # Title
+        title_el = card.select_one(
+            '[data-automation-id="product-title"], '
+            "a span.lh-title, "
+            "a[class*='product-title'], "
+            "span.w_iUH7"
+        )
+        if title_el:
+            product["title"] = title_el.get_text(strip=True)
+        else:
+            return None
+
+        # Link / URL
+        link_el = card.select_one("a[href*='/ip/']")
+        if link_el:
+            href = link_el.get("href", "")
+            if href.startswith("/"):
+                href = f"https://www.walmart.com{href}"
+            product["url"] = href.split("?")[0]
+
+            # Extract product ID from URL
+            id_match = re.search(r"/ip/(?:.*?/)?(\d+)", href)
+            if id_match:
+                product["product_id"] = id_match.group(1)
+
+        # Price
+        price_el = card.select_one(
+            '[data-automation-id="product-price"] .f2, '
+            'span[itemprop="price"], '
+            '[class*="price-main"] .visuallyhidden, '
+            'div[data-testid="list-view"] span.f2'
+        )
+        if price_el:
+            price_text = price_el.get_text(strip=True)
+            product["price"] = self._parse_price_text(price_text)
+            product["price_display"] = f"${product['price']:.2f}" if product["price"] else ""
+
+        # Was price
+        was_el = card.select_one(
+            '[data-testid="was-price"], '
+            "span.strike, "
+            "[class*='was-price']"
+        )
+        if was_el:
+            product["original_price"] = self._parse_price_text(was_el.get_text(strip=True))
+
+        # Rating
+        rating_el = card.select_one(
+            "span.w_iUH7[data-testid], "
+            '[class*="stars-container"]'
+        )
+        if rating_el:
+            rating_text = rating_el.get("aria-label", "") or rating_el.get_text(strip=True)
+            m = re.search(r"([\d.]+)\s*(?:out of|stars)", rating_text)
+            if m:
+                product["rating"] = float(m.group(1))
+
+        # Reviews count
+        review_el = card.select_one("span.sans-serif, [class*='review-count']")
+        if review_el:
+            m = re.search(r"(\d+)", review_el.get_text(strip=True).replace(",", ""))
+            if m:
+                product["review_count"] = int(m.group(1))
+
+        # Image
+        img_el = card.select_one("img[data-testid='productTileImage'], img[src*='i5.walmartimages']")
+        if img_el:
+            product["image_url"] = img_el.get("src", "")
+
+        # Rollback badge
+        rollback_el = card.select_one("[data-testid='rollback-badge'], [class*='rollback']")
+        if rollback_el:
+            product["is_rollback"] = True
+            product["badge"] = "Rollback"
+
+        return product
+
+    def _parse_price_text(self, text: str) -> float:
+        if not text:
+            return 0.0
+        cleaned = re.sub(r"[^\d.]", "", text)
+        try:
+            return float(cleaned)
+        except ValueError:
+            return 0.0
+
+    # ------------------------------------------------------------------
+    # PRODUCT DETAILS (individual page)
+    # ------------------------------------------------------------------
+
+    def get_product_details(self, product_id: str) -> dict | None:
+        """Fetch a single product page for detailed info."""
+        url = f"https://www.walmart.com/ip/{product_id}"
+
+        try:
+            self._respectful_delay()
+            html = self._fetch_page(url)
+            if not html:
+                return None
+
+            soup = BeautifulSoup(html, "lxml")
+            details = {"product_id": product_id}
+
+            # Try __NEXT_DATA__
+            script = soup.find("script", {"id": "__NEXT_DATA__"})
+            if script and script.string:
+                try:
+                    data = json.loads(script.string)
+                    product = (
+                        data.get("props", {})
+                        .get("pageProps", {})
+                        .get("initialData", {})
+                        .get("data", {})
+                        .get("product", {})
+                    )
+
+                    if product:
+                        details["full_title"] = product.get("name", "")
+                        details["long_description"] = product.get("longDescription", "")
+                        details["short_description"] = product.get("shortDescription", "")
+                        details["brand"] = product.get("brand", "")
+                        details["upc"] = product.get("upc", "")
+                        details["model"] = product.get("model", "")
+                        details["category_path"] = product.get("categoryPath", "")
+
+                        # Seller info
+                        seller = product.get("sellerInfo", {})
+                        if seller:
+                            details["sold_by"] = seller.get("sellerName", "")
+                            details["seller_id"] = seller.get("sellerId", "")
+
+                        # Availability
+                        offers = product.get("offers", [])
+                        if offers:
+                            offer = offers[0] if isinstance(offers, list) else offers
+                            details["availability"] = offer.get("availability", "")
+                            details["offer_type"] = offer.get("offerType", "")
+
+                except (json.JSONDecodeError, KeyError):
+                    pass
+
+            return details
+
+        except Exception as e:
+            print(f"   ⚠️  Could not fetch details for {product_id}: {e}")
+            return None
+```
+
+---
+
+## 6. `walmart_api.py`
+
+```python
+"""
+Walmart Affiliate API interface (optional).
+For users with Walmart Affiliate API access.
+"""
+
+import time
+import requests
+from config import Config
+
+
+class WalmartAPI:
+    """
+    Walmart Affiliate API v1 wrapper.
+    Apply for access: https://affiliates.walmart.com/
+    """
+
+    BASE_URL = "https://developer.api.walmart.com/api-proxy/service/affil/product/v2"
+
+    def __init__(self):
+        self.api_key = Config.WALMART_API_KEY
+        self.affiliate_id = Config.WALMART_AFFILIATE_ID
+        self.available = bool(self.api_key)
+
+        if self.available:
+            print(f"✅ Walmart API configured (Affiliate ID: {self.affiliate_id[:8]}...)")
+        else:
+            print("ℹ️  Walmart API not configured — using scrape mode")
+
+    def _headers(self) -> dict:
+        return {
+            "WM_SEC.KEY_VERSION": "1",
+            "WM_CONSUMER.ID": self.api_key,
+            "WM_CONSUMER.INTIMESTAMP": str(int(time.time() * 1000)),
+            "Accept": "application/json",
+        }
+
+    def search(self, query: str, sort: str = "relevance", num_items: int = 25) -> list:
+        """Search Walmart via official API."""
+        if not self.available:
+            return []
+
+        try:
+            resp = requests.get(
+                f"{self.BASE_URL}/search",
+                params={
+                    "query": query,
+                    "sort": sort,
+                    "numItems": min(num_items, 25),
+                    "format": "json",
+                },
+                headers=self._headers(),
+                timeout=15,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            products = []
+            for item in data.get("items", []):
+                product = self._parse_api_item(item)
+                if product:
+                    products.append(product)
+
+            return products
+
+        except Exception as e:
+            print(f"   ⚠️  Walmart API error: {e}")
+            return []
+
+    def get_item(self, item_id: str) -> dict | None:
+        """Get single item details by Walmart ID."""
+        if not self.available:
+            return None
+
+        try:
+            resp = requests.get(
+                f"{self.BASE_URL}/items/{item_id}",
+                headers=self._headers(),
+                timeout=15,
+            )
+            resp.raise_for_status()
+            return self._parse_api_item(resp.json())
+        except Exception as e:
+            print(f"   ⚠️  API item lookup failed: {e}")
+            return None
+
+    def _parse_api_item(self, item: dict) -> dict | None:
+        """Parse API response item into standard product dict."""
+        if not item or not item.get("name"):
+            return None
+
+        price = item.get("salePrice", item.get("msrp", 0))
+        if not price or price <= 0:
+            return None
+
+        return {
+            "product_id": str(item.get("itemId", "")),
+            "title": item.get("name", ""),
+            "brand": item.get("brandName", ""),
+            "price": float(price),
+            "price_display": f"${float(price):.2f}",
+            "original_price": float(item.get("msrp", 0) or 0),
+            "walmart_plus_price": None,
+            "rating": float(item.get("customerRating", 0) or 0),
+            "review_count": int(item.get("numReviews", 0) or 0),
+            "seller": "Walmart.com",
+            "fulfillment": "Standard",
+            "is_rollback": bool(item.get("rollBack")),
+            "is_reduced": bool(item.get("reducedPrice")),
+            "is_sponsored": False,
+            "badge": "Rollback" if item.get("rollBack") else "",
+            "image_url": item.get("thumbnailImage", ""),
+            "url": item.get("productUrl", f"https://www.walmart.com/ip/{item.get('itemId', '')}"),
+            "is_marketplace": bool(item.get("marketplace")),
+            "upc": item.get("upc", ""),
+            "model_number": item.get("modelNumber", ""),
+            "stock": item.get("stock", ""),
+            "available_online": item.get("availableOnline", True),
+        }
+```
+
+---
+
+## 7. `product_verifier.py`
+
+```python
+"""
+Product Verifier — AI-powered verification that found products
+actually match what the user wants.
+"""
+
+from config import Config
+from ai_engine import AIEngine
+
+
+class ProductVerifier:
+
+    def __init__(self, ai: AIEngine):
+        self.ai = ai
+        self.min_confidence = Config.MIN_MATCH_CONFIDENCE
+
+    def verify_all(self, wanted: dict, candidates: list) -> list:
+        if not candidates:
+            return []
+
+        print(f"\n🤖 AI Verifying {len(candidates)} products...")
+        print(f"   Mode: {Config.VERIFICATION_MODE} | Min confidence: {self.min_confidence}%")
+
+        verified = []
+        rejected = 0
+
+        for i, product in enumerate(candidates):
+            title_short = product["title"][:55]
+            print(f"\n   [{i+1}/{len(candidates)}] {title_short}...")
+
+            result = self.ai.verify_product_match(wanted, product)
+
+            confidence = result.get("confidence", 0)
+            match_type = result.get("match_type", "no_match")
+            reasoning = result.get("reasoning", "")
+
+            if result.get("is_match") and confidence >= self.min_confidence:
+                product["match_confidence"] = confidence
+                product["match_type"] = match_type
+                product["match_reasoning"] = reasoning
+                product["match_concerns"] = result.get("concerns", [])
+                product["is_refurbished"] = result.get("is_refurbished", False)
+                product["is_bundle"] = result.get("is_bundle", False)
+                verified.append(product)
+
+                emoji = {"exact": "🎯", "close": "✅", "partial": "🟡"}.get(match_type, "✅")
+                print(f"   {emoji} MATCH ({confidence}% {match_type}): {reasoning[:75]}")
+            else:
+                rejected += 1
+                print(f"   ❌ REJECTED ({confidence}% {match_type}): {reasoning[:75]}")
+
+        print(f"\n📊 Verification: {len(verified)} matches, {rejected} rejected")
+
+        # Sort: highest confidence → lowest price
+        verified.sort(key=lambda x: (-x.get("match_confidence", 0), x.get("price", 9999)))
+
+        return verified
+```
+
+---
+
+## 8. `deal_analyzer.py`
+
+```python
+"""
+Deal Analyzer — Evaluates Walmart-specific deal quality:
+rollback pricing, Walmart+ savings, marketplace vs direct, etc.
+"""
+
+from config import Config
+
+
+class DealAnalyzer:
+
+    @staticmethod
+    def analyze(products: list) -> list:
+        """Add deal analysis fields to each verified product."""
+        if not products:
+            return products
+
+        prices = [p["price"] for p in products if p.get("price", 0) > 0]
+        if not prices:
+            return products
+
+        avg_price = sum(prices) / len(prices)
+        min_price = min(prices)
+        max_price = max(prices)
+
+        for product in products:
+            analysis = {}
+            price = product.get("price", 0)
+
+            # --- Price position ---
+            if price <= min_price * 1.05:
+                analysis["price_rating"] = "🟢 Lowest"
+            elif price <= avg_price:
+                analysis["price_rating"] = "🟡 Below Average"
+            elif price <= avg_price * 1.15:
+                analysis["price_rating"] = "🟠 Average"
+            else:
+                analysis["price_rating"] = "🔴 Above Average"
+
+            # --- Savings from original ---
+            original = product.get("original_price", 0)
+            if original and original > price:
+                savings = original - price
+                pct = (savings / original) * 100
+                analysis["savings"] = savings
+                analysis["savings_pct"] = pct
+                analysis["savings_display"] = f"${savings:.2f} ({pct:.0f}% off)"
+            else:
+                analysis["savings"] = 0
+                analysis["savings_pct"] = 0
+                analysis["savings_display"] = ""
+
+            # --- Walmart+ savings ---
+            wp_price = product.get("walmart_plus_price")
+            if wp_price and wp_price < price:
+                wp_savings = price - wp_price
+                analysis["walmart_plus_savings"] = wp_savings
+                analysis["walmart_plus_display"] = (
+                    f"W+ Price: ${wp_price:.2f} (save ${wp_savings:.2f})"
+                )
+            else:
+                analysis["walmart_plus_savings"] = 0
+                analysis["walmart_plus_display"] = ""
+
+            # --- Seller trust ---
+            if product.get("is_marketplace"):
+                seller = product.get("seller", "Unknown")
+                analysis["seller_trust"] = f"⚠️  Marketplace: {seller}"
+                analysis["seller_warning"] = True
+            else:
+                analysis["seller_trust"] = "✅ Sold by Walmart"
+                analysis["seller_warning"] = False
+
+            # --- Fulfillment ---
+            fulfillment = product.get("fulfillment", "")
+            if "2-day" in fulfillment.lower() or "next day" in fulfillment.lower():
+                analysis["shipping_rating"] = "🚀 Fast"
+            elif "free" in fulfillment.lower():
+                analysis["shipping_rating"] = "📦 Free Shipping"
+            else:
+                analysis["shipping_rating"] = "📦 Standard"
+
+            # --- Flags ---
+            warnings = []
+            if product.get("is_refurbished"):
+                warnings.append("🔄 Refurbished/Restored")
+            if product.get("is_bundle"):
+                warnings.append("📦 Bundle (not single item)")
+            if product.get("is_sponsored"):
+                warnings.append("📢 Sponsored Listing")
+            if product.get("is_marketplace") and price < avg_price * 0.5:
+                warnings.append("⚠️  Suspiciously low price from marketplace seller")
+
+            analysis["warnings"] = warnings
+
+            # --- Deal score (0-100) ---
+            score = 50  # baseline
+
+            # Price position impact
+            if prices:
+                price_rank = sorted(prices).index(price) if price in prices else len(prices) // 2
+                score += int((1 - price_rank / max(len(prices), 1)) * 20)
+
+            # Savings bonus
+            if analysis["savings_pct"] > 20:
+                score += 15
+            elif analysis["savings_pct"] > 10:
+                score += 10
+            elif analysis["savings_pct"] > 5:
+                score += 5
+
+            # Rollback bonus
+            if product.get("is_rollback"):
+                score += 5
+
+            # Rating bonus
+            rating = product.get("rating", 0)
+            reviews = product.get("review_count", 0)
+            if rating >= 4.5 and reviews >= 100:
+                score += 10
+            elif rating >= 4.0 and reviews >= 50:
+                score += 5
+
+            # Walmart-sold bonus
+            if not product.get("is_marketplace"):
+                score += 5
+
+            # Penalties
+            if product.get("is_refurbished"):
+                score -= 10
+            if product.get("is_marketplace") and price < avg_price * 0.5:
+                score -= 15
+            if product.get("is_sponsored"):
+                score -= 3
+
+            analysis["deal_score"] = max(0, min(100, score))
+
+            product["deal_analysis"] = analysis
+
+        return products
+```
+
+---
+
+## 9. `price_history.py`
+
+```python
+"""
+Price History — Tracks prices over time in SQLite.
+Shows trends and alerts on notable changes.
+"""
+
+import sqlite3
+from datetime import datetime, timedelta
+from pathlib import Path
+
+from config import Config
+
+
+class PriceHistory:
+
+    def __init__(self):
+        Config.ensure_dirs()
+        self.db_path = Config.DB_PATH
+        self.enabled = Config.ENABLE_PRICE_HISTORY
+        self._init_db()
+
+    def _init_db(self):
+        if not self.enabled:
+            return
+
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS price_records (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    product_id TEXT NOT NULL,
+                    title TEXT,
+                    brand TEXT,
+                    price REAL NOT NULL,
+                    original_price REAL,
+                    walmart_plus_price REAL,
+                    seller TEXT,
+                    is_marketplace INTEGER DEFAULT 0,
+                    search_query TEXT,
+                    recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_product_date
+                ON price_records (product_id, recorded_at DESC)
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS searches (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    query TEXT NOT NULL,
+                    product_understood TEXT,
+                    results_found INTEGER,
+                    verified_matches INTEGER,
+                    best_price REAL,
+                    searched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+    def record_products(self, products: list, search_query: str = ""):
+        """Record all product prices for history tracking."""
+        if not self.enabled or not products:
+            return
+
+        with sqlite3.connect(self.db_path) as conn:
+            for p in products:
+                conn.execute(
+                    """INSERT INTO price_records
+                       (product_id, title, brand, price, original_price,
+                        walmart_plus_price, seller, is_marketplace, search_query)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        p.get("product_id", ""),
+                        p.get("title", ""),
+                        p.get("brand", ""),
+                        p.get("price", 0),
+                        p.get("original_price", 0),
+                        p.get("walmart_plus_price"),
+                        p.get("seller", ""),
+                        1 if p.get("is_marketplace") else 0,
+                        search_query,
+                    ),
+                )
+
+    def record_search(
+        self, query: str, product_name: str, found: int, verified: int, best_price: float
+    ):
+        """Record a search event."""
+        if not self.enabled:
+            return
+
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """INSERT INTO searches
+                   (query, product_understood, results_found, verified_matches, best_price)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (query, product_name, found, verified, best_price),
+            )
+
+    def get_price_history(self, product_id: str, days: int = 30) -> list:
+        """Get price history for a product."""
+        if not self.enabled:
+            return []
+
+        cutoff = datetime.now() - timedelta(days=days)
+
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """SELECT price, walmart_plus_price, seller, is_marketplace, recorded_at
+                   FROM price_records
+                   WHERE product_id = ? AND recorded_at >= ?
+                   ORDER BY recorded_at DESC""",
+                (product_id, cutoff.isoformat()),
+            ).fetchall()
+
+        return [dict(r) for r in rows]
+
+    def check_price_alerts(self, products: list) -> list:
+        """Check if any products have notable price changes."""
+        if not self.enabled:
+            return []
+
+        alerts = []
+        threshold = Config.PRICE_DROP_ALERT_PCT / 100.0
+
+        with sqlite3.connect(self.db_path) as conn:
+            for p in products:
+                pid = p.get("product_id", "")
+                if not pid:
+                    continue
+
+                row = conn.execute(
+                    """SELECT price FROM price_records
+                       WHERE product_id = ?
+                       ORDER BY recorded_at DESC LIMIT 1 OFFSET 1""",
+                    (pid,),
+                ).fetchone()
+
+                if row and row[0] > 0:
+                    last_price = row[0]
+                    current = p["price"]
+                    change_pct = (current - last_price) / last_price
+
+                    if change_pct <= -threshold:
+                        alerts.append({
+                            "product_id": pid,
+                            "title": p.get("title", ""),
+                            "old_price": last_price,
+                            "new_price": current,
+                            "change_pct": change_pct * 100,
+                            "type": "drop",
+                        })
+                    elif change_pct >= threshold:
+                        alerts.append({
+                            "product_id": pid,
+                            "title": p.get("title", ""),
+                            "old_price": last_price,
+                            "new_price": current,
+                            "change_pct": change_pct * 100,
+                            "type": "increase",
+                        })
+
+        return alerts
+
+    def get_search_history(self, limit: int = 20) -> list:
+        """Get recent searches."""
+        if not self.enabled:
+            return []
+
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """SELECT * FROM searches ORDER BY searched_at DESC LIMIT ?""",
+                (limit,),
+            ).fetchall()
+
+        return [dict(r) for r in rows]
+```
+
+---
+
+## 10. `result_formatter.py`
+
+```python
+"""
+Result Formatter — Rich console display for Walmart results.
+"""
+
+from rich.console import Console
+from rich.table import Table
+from rich.panel import Panel
+from rich.text import Text
+from rich.columns import Columns
+from rich import box
+
+
+console = Console()
+
+
+def display_product_understanding(product_info: dict):
+    content = Text()
+    content.append("Product:    ", style="bold")
+    content.append(f"{product_info.get('product_name', 'Unknown')}\n")
+    if product_info.get("brand"):
+        content.append("Brand:      ", style="bold")
+        content.append(f"{product_info['brand']}\n")
+    if product_info.get("model"):
+        content.append("Model:      ", style="bold")
+        content.append(f"{product_info['model']}\n")
+    if product_info.get("category"):
+        content.append("Category:   ", style="bold")
+        content.append(f"{product_info['category']}\n")
+    if product_info.get("walmart_department"):
+        content.append("Department: ", style="bold")
+        content.append(f"{product_info['walmart_department']}\n")
+    if product_info.get("key_features"):
+        content.append("Features:   ", style="bold")
+        content.append(f"{', '.join(product_info['key_features'])}\n")
+    if product_info.get("price_range_hint"):
+        content.append("Est. Price: ", style="bold")
+        content.append(f"{product_info['price_range_hint']}\n")
+
+    content.append("\nSearch Queries:\n", style="bold yellow")
+    for i, q in enumerate(product_info.get("search_queries", []), 1):
+        content.append(f"  {i}. {q}\n")
+
+    console.print(Panel(
+        content,
+        title="🤖 AI Product Understanding",
+        border_style="cyan",
+        box=box.ROUNDED,
+    ))
+
+
+def display_results(wanted: dict, verified: list, ai_recommendation: str):
+    if not verified:
+        console.print(Panel(
+            "[bold red]No verified matching products found on Walmart.[/]\n\n"
+            "Try:\n"
+            "• Different wording\n"
+            "• Less specific query\n"
+            "• --strict loose for broader matching",
+            title="❌ No Results",
+            border_style="red",
+        ))
+        return
+
+    cheapest = min(verified, key=lambda x: x.get("price", 9999))
+    best_deal = max(verified, key=lambda x: x.get("deal_analysis", {}).get("deal_score", 0))
+
+    console.print()
+
+    # ── BEST PRICE PANEL ──
+    bp = Text()
+    bp.append(f"💰 ${cheapest['price']:.2f}", style="bold green on black")
+    bp.append("\n\n")
+    bp.append(f"{cheapest['title']}\n\n", style="bold")
+
+    orig = cheapest.get("original_price", 0)
+    if orig and orig > cheapest["price"]:
+        savings = orig - cheapest["price"]
+        pct = (savings / orig) * 100
+        bp.append(f"Was: ${orig:.2f} ", style="strike dim")
+        bp.append(f"Save: ${savings:.2f} ({pct:.0f}% off)\n", style="bold green")
+
+    if cheapest.get("is_rollback"):
+        bp.append("🔴 ROLLBACK PRICE\n", style="bold red")
+
+    wp_price = cheapest.get("walmart_plus_price")
+    if wp_price and wp_price < cheapest["price"]:
+        bp.append(f"💎 Walmart+ Price: ${wp_price:.2f}\n", style="bold blue")
+
+    if cheapest.get("rating"):
+        stars = "⭐" * int(cheapest["rating"])
+        bp.append(f"{stars} {cheapest['rating']}/5")
+        if cheapest.get("review_count"):
+            bp.append(f" ({cheapest['review_count']:,} reviews)")
+        bp.append("\n")
+
+    if cheapest.get("is_marketplace"):
+        bp.append(f"⚠️  Marketplace seller: {cheapest.get('seller', '?')}\n", style="yellow")
+    else:
+        bp.append("✅ Sold & shipped by Walmart\n", style="green")
+
+    bp.append(f"\n🔗 {cheapest['url']}\n")
+    bp.append(
+        f"Match: {cheapest.get('match_confidence', '?')}% ({cheapest.get('match_type', '?')})",
+        style="dim",
+    )
+
+    console.print(Panel(bp, title="🏆 BEST PRICE FOUND", border_style="green", box=box.DOUBLE, padding=(1, 2)))
+
+    # ── BEST DEAL (if different) ──
+    deal_analysis = best_deal.get("deal_analysis", {})
+    if best_deal["product_id"] != cheapest["product_id"] and deal_analysis.get("deal_score", 0) > 60:
+        bd = Text()
+        bd.append(f"💰 ${best_deal['price']:.2f}  ", style="bold yellow")
+        bd.append(f"(Deal Score: {deal_analysis.get('deal_score', 0)}/100)\n\n")
+        bd.append(f"{best_deal['title']}\n\n", style="bold")
+        bd.append(f"Why: Better rating, seller trust, or value.\n", style="dim")
+        bd.append(f"🔗 {best_deal['url']}\n")
+
+        console.print(Panel(bd, title="⭐ BEST OVERALL DEAL", border_style="yellow", box=box.ROUNDED))
+
+    # ── ALL RESULTS TABLE ──
+    if len(verified) > 1:
+        table = Table(
+            title=f"📋 All {len(verified)} Verified Matches",
+            box=box.ROUNDED,
+            show_lines=True,
+        )
+        table.add_column("#", style="dim", width=3, justify="center")
+        table.add_column("Product", max_width=45)
+        table.add_column("Price", justify="right", style="green bold", width=10)
+        table.add_column("Rating", justify="center", width=12)
+        table.add_column("Seller", width=14)
+        table.add_column("Deal", justify="center", width=10)
+        table.add_column("Match", justify="center", width=7)
+
+        for i, p in enumerate(verified, 1):
+            price_str = f"${p['price']:.2f}"
+            if p == cheapest:
+                price_str = f"[bold green]${p['price']:.2f} ★[/]"
+
+            if p.get("original_price", 0) > p["price"]:
+                price_str += f"\n[dim strike]${p['original_price']:.2f}[/]"
+
+            rating = p.get("rating", 0)
+            reviews = p.get("review_count", 0)
+            rating_str = f"{'⭐' * min(int(rating), 5)} {rating}" if rating else "N/A"
+            if reviews:
+                rating_str += f"\n({reviews:,})"
+
+            seller_str = "🏪 Walmart" if not p.get("is_marketplace") else f"🏬 {p.get('seller', '?')[:12]}"
+
+            da = p.get("deal_analysis", {})
+            deal_str = da.get("price_rating", "")
+            ds = da.get("deal_score", 0)
+            deal_str += f"\n{ds}/100"
+
+            conf = p.get("match_confidence", 0)
+            match_str = f"[green]{conf}%[/]" if conf >= 90 else f"[yellow]{conf}%[/]" if conf >= 75 else f"[red]{conf}%[/]"
+
+            title = p["title"][:43]
+            flags = []
+            if p.get("is_rollback"):
+                flags.append("🔴 Rollback")
+            if p.get("is_refurbished"):
+                flags.append("🔄 Refurb")
+            if p.get("walmart_plus_price"):
+                flags.append(f"💎 W+ ${p['walmart_plus_price']:.2f}")
+            if flags:
+                title += "\n" + " ".join(flags)
+
+            table.add_row(str(i), title, price_str, rating_str, seller_str, deal_str, match_str)
+
+        console.print(table)
+
+        console.print("\n[bold]🔗 Product Links:[/]")
+        for i, p in enumerate(verified, 1):
+            marker = " 👈 BEST PRICE" if p == cheapest else ""
+            console.print(f"   {i}. {p['url']}{marker}")
+
+    # ── AI RECOMMENDATION ──
+    if ai_recommendation:
+        console.print(Panel(
+            ai_recommendation,
+            title="🤖 AI Recommendation",
+            border_style="yellow",
+            box=box.ROUNDED,
+            padding=(1, 2),
+        ))
+
+    # ── PRICE ALERTS ──
+    alerts = [p for p in verified if p.get("deal_analysis", {}).get("warnings")]
+    if alerts:
+        alert_text = ""
+        for p in alerts:
+            for w in p["deal_analysis"]["warnings"]:
+                alert_text += f"• {p['title'][:40]}... → {w}\n"
+        if alert_text:
+            console.print(Panel(alert_text.strip(), title="⚠️  Alerts", border_style="red", box=box.SIMPLE))
+
+    # ── PRICE SUMMARY ──
+    if len(verified) > 1:
+        prices = [p["price"] for p in verified if p.get("price", 0) > 0]
+        if len(prices) > 1:
+            console.print(Panel(
+                f"Price Range: ${min(prices):.2f} — ${max(prices):.2f}  "
+                f"(spread: ${max(prices)-min(prices):.2f})\n"
+                f"Average:     ${sum(prices)/len(prices):.2f}",
+                title="📊 Price Comparison",
+                border_style="blue",
+                box=box.SIMPLE,
+            ))
+
+
+def display_price_alerts(alerts: list):
+    """Show price change alerts."""
+    if not alerts:
+        return
+
+    for alert in alerts:
+        direction = "📉 PRICE DROP" if alert["type"] == "drop" else "📈 PRICE INCREASE"
+        color = "green" if alert["type"] == "drop" else "red"
+
+        console.print(Panel(
+            f"[bold]{alert['title'][:60]}[/]\n"
+            f"Was: ${alert['old_price']:.2f} → Now: ${alert['new_price']:.2f} "
+            f"([{color}]{alert['change_pct']:+.1f}%[/])",
+            title=direction,
+            border_style=color,
+        ))
+
+
+def display_search_history(searches: list):
+    """Show past searches."""
+    if not searches:
+        console.print("[dim]No search history yet.[/]")
+        return
+
+    table = Table(title="📜 Search History", box=box.SIMPLE)
+    table.add_column("Date", width=19)
+    table.add_column("Query", max_width=40)
+    table.add_column("Product", max_width=30)
+    table.add_column("Found", justify="center", width=6)
+    table.add_column("Matches", justify="center", width=8)
+    table.add_column("Best Price", justify="right", width=10)
+
+    for s in searches:
+        table.add_row(
+            s.get("searched_at", "")[:19],
+            s.get("query", "")[:38],
+            s.get("product_understood", "")[:28],
+            str(s.get("results_found", 0)),
+            str(s.get("verified_matches", 0)),
+            f"${s['best_price']:.2f}" if s.get("best_price") else "—",
+        )
+
+    console.print(table)
+```
+
+---
+
+## 11. `main.py`
+
+```python
+#!/usr/bin/env python3
+"""
+AI-Powered Walmart Price Finder using Ollama
+Find the best price on Walmart for any product.
+"""
+
+import sys
+import argparse
+
+from rich.console import Console
+from rich.panel import Panel
+from rich import box
+
+from config import Config
+from ai_engine import AIEngine
+from walmart_scraper import WalmartScraper
+from walmart_api import WalmartAPI
+from product_verifier import ProductVerifier
+from deal_analyzer import DealAnalyzer
+from price_history import PriceHistory
+from result_formatter import (
+    display_product_understanding,
+    display_results,
+    display_price_alerts,
+    display_search_history,
+)
+
+
+console = Console()
+
+
+def show_banner():
+    console.print("""
+╔═══════════════════════════════════════════════════════════╗
+║     🛒  AI-Powered Walmart Price Finder  🤖              ║
+║     Powered by Ollama (local AI)                          ║
+║     Scrape + Verify + Best Deal                           ║
+╚═══════════════════════════════════════════════════════════╝""", style="bold blue")
+
+
+def find_product(
+    query: str = None,
+    image_path: str = None,
+    sort_by: str = "best_match",
+    verification_mode: str = None,
+    show_rejected: bool = False,
+    top_n: int = 15,
+    skip_confirm: bool = False,
+):
+    """Main pipeline: Understand → Search → Verify → Analyze → Rank → Display."""
+
+    if not query and not image_path:
+        console.print("[red]Provide a product query or image.[/]")
+        return
+
+    if verification_mode:
+        Config.VERIFICATION_MODE = verification_mode
+
+    Config.ensure_dirs()
+
+    # Initialize
+    console.print("\n⚙️  Initializing...", style="dim")
+    ai = AIEngine()
+    history = PriceHistory()
+
+    # Choose search backend
+    walmart_api = WalmartAPI()
+    scraper = WalmartScraper()
+    verifier = ProductVerifier(ai)
+
+    # ═══════════════════════════════════════════
+    # STEP 1: UNDERSTAND
+    # ═══════════════════════════════════════════
+    console.print("\n🧠 [bold]Step 1:[/] Understanding your request...\n")
+
+    product_info = ai.understand_query(
+        user_input=query or "",
+        image_path=image_path,
+    )
+
+    display_product_understanding(product_info)
+
+    if not skip_confirm:
+        console.print(
+            "\n[yellow]Does this look right?[/] "
+            "(Enter to continue, or type a correction)"
+        )
+        try:
+            correction = input("> ").strip()
+            if correction:
+                console.print("🔄 Re-analyzing...\n")
+                combined = f"{query or ''} {correction}".strip()
+                product_info = ai.understand_query(combined)
+                display_product_understanding(product_info)
+        except (EOFError, KeyboardInterrupt):
+            pass
+
+    # ═══════════════════════════════════════════
+    # STEP 2: SEARCH WALMART
+    # ═══════════════════════════════════════════
+    console.print("\n🔎 [bold]Step 2:[/] Searching Walmart...\n")
+
+    search_queries = product_info.get("search_queries", [query or ""])
+    all_products = []
+
+    # Try API first if available
+    if walmart_api.available:
+        console.print("   📡 Using Walmart API...")
+        for sq in search_queries:
+            api_results = walmart_api.search(sq)
+            all_products.extend(api_results)
+
+    # Always scrape as well (or as primary method)
+    console.print("   🌐 Scraping walmart.com...")
+    scrape_results = scraper.search_multiple_queries(search_queries)
+
+    # Merge API + scrape, deduplicate
+    seen_ids = {p["product_id"] for p in all_products}
+    for p in scrape_results:
+        if p["product_id"] not in seen_ids:
+            seen_ids.add(p["product_id"])
+            all_products.append(p)
+
+    if not all_products:
+        console.print(Panel(
+            "[bold red]No products found on Walmart.[/]\n"
+            "Try different search terms or check your connection.\n"
+            "If scraping returns empty, try setting USE_BROWSER=true in .env",
+            title="❌ No Results",
+            border_style="red",
+        ))
+        scraper.close()
+        return
+
+    console.print(f"\n✅ Found {len(all_products)} total products")
+
+    # Sort by price, take top N
+    all_products.sort(key=lambda x: x.get("price", 9999))
+
+    # Filter out marketplace if disabled
+    if not Config.INCLUDE_MARKETPLACE:
+        all_products = [p for p in all_products if not p.get("is_marketplace")]
+        console.print(f"   (Filtered to {len(all_products)} Walmart-sold items)")
+
+    candidates = all_products[:top_n]
+    console.print(f"🔍 Verifying top {len(candidates)} candidates...\n")
+
+    # ═══════════════════════════════════════════
+    # STEP 3: AI VERIFICATION
+    # ═══════════════════════════════════════════
+    console.print("🤖 [bold]Step 3:[/] AI verifying product matches...\n")
+
+    verified = verifier.verify_all(product_info, candidates)
+
+    if show_rejected:
+        console.print(f"   ℹ️  {len(candidates) - len(verified)} products rejected")
+
+    # ═══════════════════════════════════════════
+    # STEP 4: DEAL ANALYSIS
+    # ═══════════════════════════════════════════
+    if verified:
+        console.print("\n📊 [bold]Step 4:[/] Analyzing deals...\n")
+        verified = DealAnalyzer.analyze(verified)
+
+    # ═══════════════════════════════════════════
+    # STEP 5: PRICE HISTORY
+    # ═══════════════════════════════════════════
+    if verified and Config.ENABLE_PRICE_HISTORY:
+        history.record_products(verified, search_query=query or "")
+        price_alerts = history.check_price_alerts(verified)
+        if price_alerts:
+            display_price_alerts(price_alerts)
+
+    # ═══════════════════════════════════════════
+    # STEP 6: AI RECOMMENDATION
+    # ═══════════════════════════════════════════
+    ai_recommendation = ""
+    if verified:
+        console.print("💡 [bold]Step 5:[/] AI generating recommendation...\n")
+        ai_recommendation = ai.rank_results(product_info, verified)
+
+    # ═══════════════════════════════════════════
+    # STEP 7: DISPLAY
+    # ═══════════════════════════════════════════
+    display_results(product_info, verified, ai_recommendation)
+
+    # Record search
+    best_price = min((p["price"] for p in verified), default=0)
+    history.record_search(
+        query=query or str(image_path),
+        product_name=product_info.get("product_name", ""),
+        found=len(all_products),
+        verified=len(verified),
+        best_price=best_price,
+    )
+
+    # Cleanup
+    scraper.close()
+
+
+def interactive_mode():
+    show_banner()
+
+    console.print(
+        "\n[bold]How to use:[/]\n"
+        "  • Product name:    [green]Milwaukee M18 brushless drill[/]\n"
+        "  • Description:     [green]that Walmart rollback TV Samsung 65 inch[/]\n"
+        "  • Image:           [green]image:/path/to/photo.jpg[/]\n"
+        "  • Image + text:    [green]image:drill.jpg Milwaukee M18[/]\n"
+        "  • Search history:  [green]history[/]\n"
+        "  • Quit:            [green]quit[/]\n"
+    )
+
+    while True:
+        try:
+            console.print("\n" + "─" * 60)
+            user_input = console.input(
+                "\n[bold blue]🔍 What product are you looking for on Walmart?[/]\n> "
+            ).strip()
+
+            if not user_input:
+                continue
+
+            if user_input.lower() in ("quit", "exit", "q"):
+                console.print("\n👋 Goodbye!", style="bold")
+                break
+
+            if user_input.lower() == "history":
+                ph = PriceHistory()
+                display_search_history(ph.get_search_history())
+                continue
+
+            image_path = None
+            query = user_input
+
+            if user_input.lower().startswith("image:"):
+                parts = user_input[6:].strip().split(" ", 1)
+                image_path = parts[0]
+                query = parts[1] if len(parts) > 1 else ""
+
+            find_product(query=query, image_path=image_path)
+
+        except KeyboardInterrupt:
+            console.print("\n\n👋 Goodbye!", style="bold")
+            break
+        except Exception as e:
+            console.print(f"\n[red]Error: {e}[/]")
+            import traceback
+            traceback.print_exc()
+            console.print("Try a different query.", style="dim")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="AI-Powered Walmart Price Finder using Ollama",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s "Milwaukee M18 brushless drill"
+  %(prog)s "Samsung 65 inch TV" --sort price_low
+  %(prog)s --image product.jpg
+  %(prog)s --image item.jpg "looks like a KitchenAid mixer"
+  %(prog)s "AirPods Pro" --strict strict --top 20
+  %(prog)s --interactive
+  %(prog)s --history
+        """,
+    )
+
+    parser.add_argument("query", nargs="*", help="Product name or description")
+    parser.add_argument("--image", "-i", type=str, help="Product image path")
+    parser.add_argument("--interactive", action="store_true", help="Interactive mode")
+    parser.add_argument(
+        "--strict",
+        choices=["strict", "moderate", "loose"],
+        default=None,
+        help="Verification strictness",
+    )
+    parser.add_argument(
+        "--sort",
+        choices=["best_match", "price_low", "price_high", "best_seller", "rating_high"],
+        default="best_match",
+        help="Sort Walmart results",
+    )
+    parser.add_argument("--top", "-n", type=int, default=15, help="Max products to verify")
+    parser.add_argument("--pages", type=int, default=None, help="Search pages override")
+    parser.add_argument("--show-rejected", action="store_true", help="Show rejected count")
+    parser.add_argument("--no-marketplace", action="store_true", help="Exclude marketplace sellers")
+    parser.add_argument("--no-browser", action="store_true", help="Disable Playwright browser")
+    parser.add_argument("--history", action="store_true", help="Show search history")
+    parser.add_argument("--yes", "-y", action="store_true", help="Skip confirmation prompt")
+
+    args = parser.parse_args()
+
+    if args.pages:
+        Config.MAX_PAGES = args.pages
+    if args.no_marketplace:
+        Config.INCLUDE_MARKETPLACE = False
+    if args.no_browser:
+        Config.USE_BROWSER = False
+
+    if args.history:
+        Config.ensure_dirs()
+        ph = PriceHistory()
+        display_search_history(ph.get_search_history())
+        return
+
+    if args.interactive or (not args.query and not args.image):
+        interactive_mode()
+    else:
+        query_text = " ".join(args.query) if args.query else None
+        show_banner()
+        find_product(
+            query=query_text,
+            image_path=args.image,
+            sort_by=args.sort,
+            verification_mode=args.strict,
+            show_rejected=args.show_rejected,
+            top_n=args.top,
+            skip_confirm=args.yes,
+        )
+
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+## Quick Start
+
+### 1. Install Ollama + Model
+```bash
+curl -fsSL https://ollama.ai/install.sh | sh
+ollama pull llama3.2:3b
+
+# Optional: vision model for images
+ollama pull llava:7b
+```
+
+### 2. Install Dependencies
+```bash
+cd walmart_price_finder
+pip install -r requirements.txt
+playwright install chromium
+```
+
+### 3. Run
+```bash
+# Direct query
+python main.py "Milwaukee M18 brushless drill"
+
+# Interactive mode
+python main.py --interactive
+
+# With image
+python main.py --image drill_photo.jpg
+
+# Walmart-sold only, sort by price
+python main.py "Sony WH-1000XM5" --sort price_low --no-marketplace
+
+# Quick mode (skip confirmation)
+python main.py "Ninja air fryer" -y
+```
+
+---
+
+## All CLI Options
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  Argument              │ Description                                │
+├────────────────────────┼────────────────────────────────────────────┤
+│  "query text"          │ Product name or description                │
+│  --image FILE          │ Product image path                         │
+│  --interactive         │ Continuous prompt mode                     │
+│  --strict MODE         │ strict / moderate / loose matching         │
+│  --sort METHOD         │ best_match/price_low/price_high/           │
+│                        │ best_seller/rating_high                    │
+│  --top N               │ Max products to AI-verify (default 15)     │
+│  --pages N             │ Walmart search pages (default 3)           │
+│  --no-marketplace      │ Exclude third-party sellers                │
+│  --no-browser          │ Disable Playwright (requests only)         │
+│  --show-rejected       │ Show rejected count                        │
+│  --history             │ Show past searches                         │
+│  --yes / -y            │ Skip AI understanding confirmation         │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Full Pipeline
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│  USER INPUT                                                    │
+│  "Milwaukee M18 brushless drill"  or  📸 image.jpg             │
+└────────────────────┬───────────────────────────────────────────┘
+                     ▼
+┌────────────────────────────────────────────────────────────────┐
+│  STEP 1: AI UNDERSTANDING  (Ollama)                           │
+│  → brand, model, features, Walmart department                  │
+│  → 3 optimized search queries                                  │
+│  → User confirms or corrects                                   │
+└────────────────────┬───────────────────────────────────────────┘
+                     ▼
+┌────────────────────────────────────────────────────────────────┐
+│  STEP 2: WALMART SEARCH                                       │
+│  → Affiliate API (if configured)                               │
+│  → Playwright browser scraping (JS-rendered)                   │
+│  → __NEXT_DATA__ JSON extraction (most reliable)               │
+│  → HTML fallback parsing                                       │
+│  → Dedup by product ID, merge sources                          │
+└────────────────────┬───────────────────────────────────────────┘
+                     ▼
+┌────────────────────────────────────────────────────────────────┐
+│  STEP 3: AI VERIFICATION  (each product individually)         │
+│  → Is this the same product?                                   │
+│  → Confidence: 0-100%                                          │
+│  → Flags: refurbished? bundle? wrong model?                    │
+│  → Rejects non-matches                                         │
+└────────────────────┬───────────────────────────────────────────┘
+                     ▼
+┌────────────────────────────────────────────────────────────────┐
+│  STEP 4: DEAL ANALYSIS  (Walmart-specific)                    │
+│  → Price position vs competitors                               │
+│  → Rollback detection                                          │
+│  → Walmart+ pricing comparison                                 │
+│  → Marketplace vs Walmart-sold trust scoring                   │
+│  → Suspiciously low price warnings                             │
+│  → Deal score 0-100                                            │
+└────────────────────┬───────────────────────────────────────────┘
+                     ▼
+┌────────────────────────────────────────────────────────────────┐
+│  STEP 5: PRICE HISTORY  (SQLite)                              │
+│  → Record all verified prices                                  │
+│  → Detect price drops/increases from last check                │
+│  → Alert on notable changes                                    │
+└────────────────────┬───────────────────────────────────────────┘
+                     ▼
+┌────────────────────────────────────────────────────────────────┐
+│  STEP 6: AI RECOMMENDATION                                    │
+│  → Best deal analysis                                          │
+│  → Seller trust considerations                                 │
+│  → Walmart+ value assessment                                   │
+│  → One-line verdict                                            │
+└────────────────────┬───────────────────────────────────────────┘
+                     ▼
+┌────────────────────────────────────────────────────────────────┐
+│  STEP 7: DISPLAY                                              │
+│  🏆 Best Price panel                                           │
+│  ⭐ Best Deal panel (if different from cheapest)               │
+│  📋 All matches table with deal scores                         │
+│  🤖 AI recommendation                                         │
+│  ⚠️  Alerts (refurb, marketplace, suspicious)                  │
+│  📊 Price comparison summary                                   │
+│  🔗 Direct Walmart links                                       │
+└────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Walmart-Specific Features vs Amazon Version
+
+```
+┌──────────────────────────┬────────────────────┬──────────────────────┐
+│  Feature                 │  Amazon Finder      │  Walmart Finder      │
+├──────────────────────────┼────────────────────┼──────────────────────┤
+│  AI Understanding        │  ✅                 │  ✅ + Department     │
+│  Image Recognition       │  ✅                 │  ✅                  │
+│  AI Verification         │  ✅                 │  ✅ + Refurb detect  │
+│  Rollback Detection      │  —                  │  ✅                  │
+│  Walmart+ Pricing        │  —                  │  ✅                  │
+│  Marketplace Filtering   │  —                  │  ✅                  │
+│  Fulfillment Flagging    │  Prime badge        │  Sold by tracking    │
+│  Deal Scoring            │  —                  │  ✅ (0-100)          │
+│  Price History DB        │  —                  │  ✅ SQLite           │
+│  Price Drop Alerts       │  —                  │  ✅                  │
+│  Search History          │  —                  │  ✅                  │
+│  Affiliate API support   │  —                  │  ✅ (optional)       │
+│  Browser rendering       │  requests only      │  ✅ Playwright       │
+│  Suspicious price warn   │  —                  │  ✅                  │
+└──────────────────────────┴────────────────────┴──────────────────────┘
+```
