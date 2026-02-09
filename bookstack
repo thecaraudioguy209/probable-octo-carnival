@@ -1,0 +1,96 @@
+To self-host BookStack, the most stable and modern method is using the LinuxServer.io Docker image. It simplifies the complex PHP/database dependencies into a single deployment. 
+BookStack Docker Compose Template 
+Create a file named docker-compose.yml and paste the following. Replace placeholders like <PASS> with secure strings: 
+A Docker Compose template to launch BookStack typically involves defining two services: one for the BookStack application and another for the MariaDB database. The BookStack service uses the lscr.io/linuxserver/bookstack:latest image and requires environment variables for PUID, PGID, timezone, application URL, and database connection details. It maps a local volume for configuration and exposes port 6875. The MariaDB service uses the lscr.io/linuxserver/mariadb:latest image, also requiring PUID, PGID, and timezone environment variables, along with MySQL root password, database name, user, and password. It maps a volume for database storage and is set to restart unless stopped. Both services are linked with a depends_on configuration. You can find example docker-compose.yml templates for BookStack from sources such as buymeacoffee.com and OmicX. 
+After creating the docker-compose.yml file, you can launch the containers using docker-compose up -d. BookStack can then be accessed via your browser at http://<your-server-ip>:6875. Initial login uses default admin credentials (email: admin@admin.com, password: password), which should be changed immediately for security. 
+For integration into an AI stack, BookStack includes diagrams.net integration, provides a rich API for adding documentation programmatically, and uses a "Shelves -> Books -> Chapters" structure for organization. BookStack does not sync with a Git repository, storing content in its database. If Git synchronization is needed, Wiki.js might be a suitable alternative. 
+Would you like the SMTP settings to connect this to the email server we discussed earlier?
+
+
+
+
+undefined
+undefined
+undefined
+11 sites
+Install BookStack by Docker - OmicX
+Dec 25, 2023 — Install BookStack by Docker * 1. Install Docker. * 2. Linux post-installation steps for Docker Engine. 2.1 Manage Docker as a non-
+
+OmicX
+
+How to Self-Host Your Own BookStack Knowledge Base with ...
+Jan 17, 2025 — Domain name (optional but recommended for accessibility). * Step 1: Install Docker and Docker Compose. Start by installing Docker ...
+
+Buy Me a Coffee
+
+linuxserver/bookstack - Docker Image
+Jan 29, 2026 — linuxserver/bookstack repository overview * The LinuxServer.io⁠ team brings you another container release featuring: * Bookstack⁠ ...
+
+Docker Hub
+
+Show all
+diagrams.net free?
+Yes, diagrams.net (formerly draw.io) is 100% free for personal and commercial use. 
+In BookStack, it is a built-in feature that requires zero extra installation. When you edit a page, you can simply click the Drawing icon (a square with a plus sign) to launch the full diagrams.net editor directly inside your browser. 
+Key Details for your AI Stack:
+No Cost: There are no paid tiers, subscriptions, or feature locks for the standalone web or desktop versions.
+Privacy: Since it’s integrated into BookStack, your diagrams are saved as PNG files (with embedded XML data) directly on your own server.
+Fully Self-Hostable: While BookStack uses the official diagrams.net server by default, you can actually host your own instance of the diagrams.net editor via Docker and point BookStack to it in your .env file for a completely private, offline setup.
+AI Friendly: You can export your diagrams as SVGs or high-res PNGs to include in your public AI project repos on Gitea. 
+How to enable it in BookStack:
+If it’s not appearing by default in your editor, add this to your BookStack .env file:
+bash
+# Enable diagrams.net integration
+DRAWIO=https://embed.diagrams.net
+Use code with caution.
+
+Would you like to see how to automate backups for your BookStack database and these diagram files?
+
+
+
+
+undefined
+undefined
+undefined
+7 sites
+Drawings & Diagrams - BookStack
+BookStack has built-in support for creating and editing drawings via integrating with diagrams.net. This integration provides very...
+
+BookStack
+
+Draw.io (Diagrams.net) review 2026 — Still a Top Choice or ...
+Sep 3, 2025 — i want you to stop paying for expensive diagramming software like Microsoft Vizio or Lucid Chart right. now there is a tool that d...
+
+
+YouTube
+·
+Speak About Digital
+
+2:34
+Draw.io Review - PCMag
+Dec 16, 2016 — Draw.io Review * Draw.io is a free online tool for creating diagrams. * Draw.io has a fair selection of templates. * Draw. io's to...
+
+PCMag
+
+Show all
+and then i can setup permissions to allow/dissalow public access on a per page basis?
+Yes, BookStack allows you to precisely control public access at the Shelf, Book, Chapter, or Page level. This is ideal for keeping your internal AI architecture private while making specific tutorials or project overviews public. 
+How to Configure Selective Public Access
+To set this up, you use a "Whitelist" approach: 
+Enable Public Viewing: In your BookStack Settings, turn on the "Allow public viewing" master switch.
+Restrict the Public Role: Navigate to Settings > Roles and edit the "Public" role. Uncheck all "View" permissions. Now, by default, a public visitor sees nothing.
+Grant Specific Access:
+Go to the specific Book or Page you want to make public.
+Click the Permissions action (usually in the top-right menu).
+Check "Enable Custom Permissions".
+Find the "Public" role in the list and check "View".
+Uncheck "Inherit defaults" for "Everyone Else" if you want to be extra strict. 
+Key Permission Behaviors
+Cascading: Permissions set at the Book level automatically apply to all Chapters and Pages within it, unless you override them individually.
+Shelves: Permissions on a Shelf do not automatically cascade to the Books on it (due to books being able to sit on multiple shelves), but there is a button to "Copy Permissions to Books" on the shelf permission page.
+Discovery: If you make a Page public but the parent Book private, the visitor will need the direct link to the page, as they won't be able to browse through the Book's table of contents. 
+Would you like to know how to use the BookStack API to automatically sync your AI project documentation from your local files?
+
+
+
+BOOKSTACK
