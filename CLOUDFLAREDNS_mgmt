@@ -1,0 +1,115 @@
+1. Node.js Scripts: Managing Cloudflare DNS via API
+Step 1: Get Your Cloudflare API Credentials
+
+API Token (preferred, for least-privilege):
+
+Go to Cloudflare dashboard > My Profile > API Tokens
+
+Create a token with “Edit DNS” permission for the desired zone(s).
+
+Step 2: Install a Node.js HTTP Client
+
+You can use node-fetch
+, axios
+, or a dedicated package like cloudflare
+.
+
+npm install axios
+
+Step 3: Script to List/Add/Edit/Delete DNS Records
+const axios = require('axios');
+
+const CLOUDFLARE_API_TOKEN = process.env.CF_API_TOKEN;
+const ZONE_ID = 'your_zone_id_here'; // Get this from Cloudflare dashboard
+
+const api = axios.create({
+  baseURL: `https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records`,
+  headers: {
+    Authorization: `Bearer ${CLOUDFLARE_API_TOKEN}`,
+    'Content-Type': 'application/json',
+  }
+});
+
+// List DNS records
+async function listRecords() {
+  const resp = await api.get('/');
+  console.log('DNS Records:', resp.data.result);
+}
+
+// Add a DNS record
+async function addRecord(type, name, content) {
+  const resp = await api.post('/', { type, name, content, ttl: 3600 });
+  console.log('Record added:', resp.data.result);
+}
+
+// Update a DNS record (record_id required)
+async function updateRecord(record_id, updates) {
+  const resp = await api.put(`/${record_id}`, updates);
+  console.log('Record updated:', resp.data.result);
+}
+
+// Delete a DNS record
+async function deleteRecord(record_id) {
+  const resp = await api.delete(`/${record_id}`);
+  console.log('Record deleted:', resp.data.result);
+}
+
+// Example usage:
+(async () => {
+  await listRecords();
+  await addRecord('A', 'test.example.com', '203.0.113.1');
+  // To update/delete, use the record_id returned from listRecords()
+})();
+
+
+Security:
+
+Never commit your API token. Store it in environment variables or a secret manager.
+
+Use least-privilege tokens (not your global API key).
+
+2. Other Approaches
+Cloudflare CLI: cloudflare-cli or cfcli
+
+cloudflare-cli (npm)
+
+cfcli (Go)
+
+These can be used in shell scripts or CI pipelines for DNS automation.
+
+Rust Automation
+
+Use cloudflare-rs
+ or just reqwest
+ for API calls.
+
+Same auth/token principles apply.
+
+3. Automate in CI/CD or CRON
+
+Place scripts in your repo (never the secrets).
+
+Run via CI/CD (e.g., GitHub Actions, GitLab CI) or via cron jobs.
+
+For production, consider using dotenv
+ or a secrets vault for credentials.
+
+4. Cloudflare API Reference
+
+Cloudflare DNS API
+
+API Tokens (Best Practices)
+
+5. Summary Table
+Task	Node.js Script	CLI	Rust	Secure?
+List Records	✅	✅	✅	Yes, if using API token
+Add/Edit/Delete	✅	✅	✅	Yes, with HTTPS, least privilege
+Want a Custom Example?
+
+Want an interactive script (with prompts)?
+
+Prefer a YAML/JSON config file to declare all DNS records and auto-sync?
+
+Want a Rust example?
+
+Let me know your preferred workflow or use case, and I’ll tailor the script or tooling!
