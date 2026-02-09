@@ -1,0 +1,1073 @@
+# Social Media Monitor Bot for "Car Audio"
+
+This is a comprehensive monitoring bot that watches Facebook Groups, Reddit Subreddits, and Instagram for posts containing "car audio".
+
+## Project Structure
+
+```
+car-audio-monitor/
+├── config.py
+├── requirements.txt
+├── main.py
+├── monitors/
+│   ├── __init__.py
+│   ├── reddit_monitor.py
+│   ├── facebook_monitor.py
+│   └── instagram_monitor.py
+├── notifier.py
+├── database.py
+├── .env
+└── README.md
+```
+
+## Files
+
+### `.env`
+```env
+# Reddit API Credentials (https://www.reddit.com/prefs/apps)
+REDDIT_CLIENT_ID=your_client_id
+REDDIT_CLIENT_SECRET=your_client_secret
+REDDIT_USER_AGENT=CarAudioMonitorBot/1.0
+
+# Facebook API (https://developers.facebook.com/)
+FACEBOOK_ACCESS_TOKEN=your_facebook_access_token
+
+# Instagram API (via Facebook Graph API)
+INSTAGRAM_ACCESS_TOKEN=your_instagram_access_token
+INSTAGRAM_BUSINESS_ACCOUNT_ID=your_business_account_id
+
+# Notification Settings
+DISCORD_WEBHOOK_URL=your_discord_webhook_url
+EMAIL_SENDER=your_email@gmail.com
+EMAIL_PASSWORD=your_app_password
+EMAIL_RECIPIENT=recipient@email.com
+SMTP_SERVER=smtp.gmail.com
+SMTP_PORT=587
+
+# Monitoring Settings
+SEARCH_KEYWORD=car audio
+CHECK_INTERVAL_SECONDS=300
+```
+
+### `requirements.txt`
+```txt
+praw==7.7.1
+requests==2.31.0
+python-dotenv==1.0.0
+schedule==1.2.1
+sqlite3-api==2.0.0
+instaloader==4.10.1
+facebook-sdk==3.1.0
+discord-webhook==1.3.0
+colorama==0.4.6
+```
+
+### `config.py`
+```python
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+class Config:
+    # Search keyword
+    SEARCH_KEYWORD = os.getenv("SEARCH_KEYWORD", "car audio")
+    CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL_SECONDS", 300))
+
+    # Reddit
+    REDDIT_CLIENT_ID = os.getenv("REDDIT_CLIENT_ID")
+    REDDIT_CLIENT_SECRET = os.getenv("REDDIT_CLIENT_SECRET")
+    REDDIT_USER_AGENT = os.getenv("REDDIT_USER_AGENT", "CarAudioMonitorBot/1.0")
+
+    # Subreddits to monitor
+    SUBREDDITS = [
+        "CarAV",
+        "CarAudio",
+        "caraudio",
+        "cars",
+        "Cartalk",
+        "CarModification",
+        "buildacarav",
+    ]
+
+    # Facebook
+    FACEBOOK_ACCESS_TOKEN = os.getenv("FACEBOOK_ACCESS_TOKEN")
+    FACEBOOK_GROUP_IDS = [
+        # Add your Facebook Group IDs here
+        # "123456789",
+    ]
+
+    # Instagram
+    INSTAGRAM_ACCESS_TOKEN = os.getenv("INSTAGRAM_ACCESS_TOKEN")
+    INSTAGRAM_BUSINESS_ACCOUNT_ID = os.getenv("INSTAGRAM_BUSINESS_ACCOUNT_ID")
+    INSTAGRAM_HASHTAGS = [
+        "caraudio",
+        "carstereo",
+        "caraudioinstall",
+        "caraudiofab",
+        "caraudiosetup",
+    ]
+
+    # Notifications
+    DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
+    EMAIL_SENDER = os.getenv("EMAIL_SENDER")
+    EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
+    EMAIL_RECIPIENT = os.getenv("EMAIL_RECIPIENT")
+    SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com")
+    SMTP_PORT = int(os.getenv("SMTP_PORT", 587))
+
+    # Database
+    DB_PATH = "car_audio_posts.db"
+```
+
+### `database.py`
+```python
+import sqlite3
+from datetime import datetime
+from config import Config
+
+
+class Database:
+    def __init__(self):
+        self.db_path = Config.DB_PATH
+        self._init_db()
+
+    def _init_db(self):
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS posts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    platform TEXT NOT NULL,
+                    post_id TEXT NOT NULL,
+                    title TEXT,
+                    content TEXT,
+                    author TEXT,
+                    url TEXT,
+                    source TEXT,
+                    found_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(platform, post_id)
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS monitor_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    platform TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    message TEXT,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            conn.commit()
+
+    def post_exists(self, platform: str, post_id: str) -> bool:
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT 1 FROM posts WHERE platform = ? AND post_id = ?",
+                (platform, post_id)
+            )
+            return cursor.fetchone() is not None
+
+    def save_post(self, platform: str, post_id: str, title: str,
+                  content: str, author: str, url: str, source: str) -> bool:
+        if self.post_exists(platform, post_id):
+            return False
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """INSERT INTO posts (platform, post_id, title, content, author, url, source)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (platform, post_id, title, content, author, url, source)
+            )
+            conn.commit()
+            return True
+
+    def log_monitor(self, platform: str, status: str, message: str):
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO monitor_log (platform, status, message) VALUES (?, ?, ?)",
+                (platform, status, message)
+            )
+            conn.commit()
+
+    def get_recent_posts(self, limit: int = 50):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT * FROM posts ORDER BY found_at DESC LIMIT ?",
+                (limit,)
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_stats(self):
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT platform, COUNT(*) as count 
+                FROM posts 
+                GROUP BY platform
+            """)
+            return {row[0]: row[1] for row in cursor.fetchall()}
+```
+
+### `monitors/__init__.py`
+```python
+from .reddit_monitor import RedditMonitor
+from .facebook_monitor import FacebookMonitor
+from .instagram_monitor import InstagramMonitor
+
+__all__ = ["RedditMonitor", "FacebookMonitor", "InstagramMonitor"]
+```
+
+### `monitors/reddit_monitor.py`
+```python
+import praw
+import re
+from datetime import datetime
+from config import Config
+from database import Database
+
+
+class RedditMonitor:
+    def __init__(self, db: Database):
+        self.db = db
+        self.keyword = Config.SEARCH_KEYWORD.lower()
+        self.subreddits = Config.SUBREDDITS
+        self.reddit = None
+        self._init_reddit()
+
+    def _init_reddit(self):
+        try:
+            self.reddit = praw.Reddit(
+                client_id=Config.REDDIT_CLIENT_ID,
+                client_secret=Config.REDDIT_CLIENT_SECRET,
+                user_agent=Config.REDDIT_USER_AGENT,
+            )
+            # Test connection (read-only is fine)
+            self.reddit.read_only = True
+            print("[Reddit] ✅ Connected successfully")
+        except Exception as e:
+            print(f"[Reddit] ❌ Connection failed: {e}")
+            self.reddit = None
+
+    def _matches_keyword(self, text: str) -> bool:
+        if not text:
+            return False
+        return bool(re.search(
+            r'\bcar\s*audio\b',
+            text,
+            re.IGNORECASE
+        ))
+
+    def check_subreddits(self) -> list:
+        if not self.reddit:
+            self.db.log_monitor("reddit", "error", "Reddit client not initialized")
+            return []
+
+        new_posts = []
+
+        for subreddit_name in self.subreddits:
+            try:
+                subreddit = self.reddit.subreddit(subreddit_name)
+
+                # Check new posts
+                for submission in subreddit.new(limit=25):
+                    self._process_submission(submission, subreddit_name, new_posts)
+
+                # Check hot posts
+                for submission in subreddit.hot(limit=10):
+                    self._process_submission(submission, subreddit_name, new_posts)
+
+                print(f"[Reddit] 🔍 Checked r/{subreddit_name}")
+
+            except Exception as e:
+                error_msg = f"Error checking r/{subreddit_name}: {e}"
+                print(f"[Reddit] ⚠️ {error_msg}")
+                self.db.log_monitor("reddit", "error", error_msg)
+
+        # Also do a global search
+        try:
+            for submission in self.reddit.subreddit("all").search(
+                self.keyword, sort="new", time_filter="day", limit=50
+            ):
+                self._process_submission(submission, "search_all", new_posts)
+            print("[Reddit] 🔍 Global search completed")
+        except Exception as e:
+            print(f"[Reddit] ⚠️ Global search error: {e}")
+
+        self.db.log_monitor("reddit", "success", f"Found {len(new_posts)} new posts")
+        return new_posts
+
+    def _process_submission(self, submission, source: str, new_posts: list):
+        title = submission.title or ""
+        selftext = submission.selftext or ""
+        combined_text = f"{title} {selftext}"
+
+        if self._matches_keyword(combined_text):
+            post_data = {
+                "platform": "reddit",
+                "post_id": submission.id,
+                "title": title[:500],
+                "content": selftext[:2000],
+                "author": str(submission.author) if submission.author else "unknown",
+                "url": f"https://reddit.com{submission.permalink}",
+                "source": f"r/{source}",
+            }
+
+            saved = self.db.save_post(**post_data)
+            if saved:
+                new_posts.append(post_data)
+                print(f"[Reddit] 🆕 New post: {title[:80]}...")
+
+    def check_comments(self) -> list:
+        """Optional: Monitor comments in specific subreddits."""
+        if not self.reddit:
+            return []
+
+        new_comments = []
+
+        for subreddit_name in self.subreddits[:3]:  # Limit to avoid rate limits
+            try:
+                subreddit = self.reddit.subreddit(subreddit_name)
+                for comment in subreddit.comments(limit=50):
+                    if self._matches_keyword(comment.body):
+                        comment_data = {
+                            "platform": "reddit_comment",
+                            "post_id": comment.id,
+                            "title": f"Comment in r/{subreddit_name}",
+                            "content": comment.body[:2000],
+                            "author": str(comment.author) if comment.author else "unknown",
+                            "url": f"https://reddit.com{comment.permalink}",
+                            "source": f"r/{subreddit_name}",
+                        }
+                        saved = self.db.save_post(**comment_data)
+                        if saved:
+                            new_comments.append(comment_data)
+            except Exception as e:
+                print(f"[Reddit] ⚠️ Comment check error for r/{subreddit_name}: {e}")
+
+        return new_comments
+```
+
+### `monitors/facebook_monitor.py`
+```python
+import requests
+from datetime import datetime
+import re
+from config import Config
+from database import Database
+
+
+class FacebookMonitor:
+    """
+    Facebook Group monitor using Graph API.
+    
+    NOTE: Facebook's API is restrictive. You need:
+    1. A Facebook App with proper permissions
+    2. A Page or User access token with groups_access_member_info permission
+    3. The app must be reviewed by Facebook for group access
+    
+    Alternative: Use web scraping (against TOS) or third-party services.
+    """
+
+    BASE_URL = "https://graph.facebook.com/v18.0"
+
+    def __init__(self, db: Database):
+        self.db = db
+        self.keyword = Config.SEARCH_KEYWORD.lower()
+        self.access_token = Config.FACEBOOK_ACCESS_TOKEN
+        self.group_ids = Config.FACEBOOK_GROUP_IDS
+        self.enabled = bool(self.access_token and self.group_ids)
+
+        if self.enabled:
+            print("[Facebook] ✅ Configured")
+        else:
+            print("[Facebook] ⚠️ Not configured (missing token or group IDs)")
+
+    def _matches_keyword(self, text: str) -> bool:
+        if not text:
+            return False
+        return bool(re.search(r'\bcar\s*audio\b', text, re.IGNORECASE))
+
+    def check_groups(self) -> list:
+        if not self.enabled:
+            return []
+
+        new_posts = []
+
+        for group_id in self.group_ids:
+            try:
+                posts = self._fetch_group_posts(group_id)
+                for post in posts:
+                    message = post.get("message", "")
+                    story = post.get("story", "")
+                    combined = f"{message} {story}"
+
+                    if self._matches_keyword(combined):
+                        post_data = {
+                            "platform": "facebook",
+                            "post_id": post["id"],
+                            "title": message[:100] if message else "No title",
+                            "content": message[:2000],
+                            "author": post.get("from", {}).get("name", "Unknown"),
+                            "url": post.get("permalink_url", f"https://facebook.com/{post['id']}"),
+                            "source": f"fb_group_{group_id}",
+                        }
+                        saved = self.db.save_post(**post_data)
+                        if saved:
+                            new_posts.append(post_data)
+                            print(f"[Facebook] 🆕 New post found in group {group_id}")
+
+                print(f"[Facebook] 🔍 Checked group {group_id}")
+
+            except Exception as e:
+                error_msg = f"Error checking group {group_id}: {e}"
+                print(f"[Facebook] ⚠️ {error_msg}")
+                self.db.log_monitor("facebook", "error", error_msg)
+
+        self.db.log_monitor("facebook", "success", f"Found {len(new_posts)} new posts")
+        return new_posts
+
+    def _fetch_group_posts(self, group_id: str) -> list:
+        url = f"{self.BASE_URL}/{group_id}/feed"
+        params = {
+            "access_token": self.access_token,
+            "fields": "id,message,story,from,permalink_url,created_time,updated_time",
+            "limit": 50,
+        }
+
+        response = requests.get(url, params=params, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+        return data.get("data", [])
+
+    def search_public(self) -> list:
+        """
+        Search public posts (limited availability).
+        Requires special Facebook API permissions.
+        """
+        if not self.access_token:
+            return []
+
+        new_posts = []
+
+        try:
+            url = f"{self.BASE_URL}/search"
+            params = {
+                "q": Config.SEARCH_KEYWORD,
+                "type": "post",
+                "access_token": self.access_token,
+                "fields": "id,message,from,permalink_url,created_time",
+                "limit": 50,
+            }
+
+            response = requests.get(url, params=params, timeout=30)
+            if response.status_code == 200:
+                data = response.json()
+                for post in data.get("data", []):
+                    message = post.get("message", "")
+                    if self._matches_keyword(message):
+                        post_data = {
+                            "platform": "facebook",
+                            "post_id": post["id"],
+                            "title": message[:100],
+                            "content": message[:2000],
+                            "author": post.get("from", {}).get("name", "Unknown"),
+                            "url": post.get("permalink_url", ""),
+                            "source": "fb_public_search",
+                        }
+                        saved = self.db.save_post(**post_data)
+                        if saved:
+                            new_posts.append(post_data)
+            else:
+                print(f"[Facebook] Public search not available: {response.status_code}")
+
+        except Exception as e:
+            print(f"[Facebook] ⚠️ Public search error: {e}")
+
+        return new_posts
+```
+
+### `monitors/instagram_monitor.py`
+```python
+import requests
+import re
+from config import Config
+from database import Database
+
+
+class InstagramMonitor:
+    """
+    Instagram monitor using Instagram Graph API (via Facebook).
+    
+    Requirements:
+    1. Facebook Developer Account
+    2. Instagram Business/Creator Account linked to a Facebook Page
+    3. Access token with instagram_basic, instagram_manage_insights permissions
+    
+    Alternative: Uses Instaloader for public data (limited, may break).
+    """
+
+    BASE_URL = "https://graph.facebook.com/v18.0"
+
+    def __init__(self, db: Database):
+        self.db = db
+        self.keyword = Config.SEARCH_KEYWORD.lower()
+        self.access_token = Config.INSTAGRAM_ACCESS_TOKEN
+        self.ig_account_id = Config.INSTAGRAM_BUSINESS_ACCOUNT_ID
+        self.hashtags = Config.INSTAGRAM_HASHTAGS
+        self.enabled = bool(self.access_token and self.ig_account_id)
+
+        if self.enabled:
+            print("[Instagram] ✅ Configured (Graph API)")
+        else:
+            print("[Instagram] ⚠️ Graph API not configured, using hashtag search fallback")
+
+    def _matches_keyword(self, text: str) -> bool:
+        if not text:
+            return False
+        return bool(re.search(r'\bcar\s*audio\b', text, re.IGNORECASE))
+
+    def check_hashtags(self) -> list:
+        """Search Instagram hashtags via Graph API."""
+        if not self.enabled:
+            return self._fallback_search()
+
+        new_posts = []
+
+        for hashtag in self.hashtags:
+            try:
+                # Step 1: Get hashtag ID
+                hashtag_id = self._get_hashtag_id(hashtag)
+                if not hashtag_id:
+                    continue
+
+                # Step 2: Get recent media for that hashtag
+                posts = self._get_hashtag_media(hashtag_id)
+
+                for post in posts:
+                    caption = post.get("caption", "")
+                    if self._matches_keyword(caption) or hashtag.lower() in ["caraudio"]:
+                        post_data = {
+                            "platform": "instagram",
+                            "post_id": post["id"],
+                            "title": caption[:100] if caption else f"#{hashtag}",
+                            "content": caption[:2000] if caption else "",
+                            "author": post.get("username", "Unknown"),
+                            "url": post.get("permalink", ""),
+                            "source": f"ig_#{hashtag}",
+                        }
+                        saved = self.db.save_post(**post_data)
+                        if saved:
+                            new_posts.append(post_data)
+                            print(f"[Instagram] 🆕 New post found: #{hashtag}")
+
+                print(f"[Instagram] 🔍 Checked #{hashtag}")
+
+            except Exception as e:
+                error_msg = f"Error checking #{hashtag}: {e}"
+                print(f"[Instagram] ⚠️ {error_msg}")
+                self.db.log_monitor("instagram", "error", error_msg)
+
+        self.db.log_monitor("instagram", "success", f"Found {len(new_posts)} new posts")
+        return new_posts
+
+    def _get_hashtag_id(self, hashtag: str) -> str:
+        url = f"{self.BASE_URL}/ig_hashtag_search"
+        params = {
+            "q": hashtag,
+            "user_id": self.ig_account_id,
+            "access_token": self.access_token,
+        }
+
+        response = requests.get(url, params=params, timeout=30)
+        if response.status_code == 200:
+            data = response.json()
+            results = data.get("data", [])
+            if results:
+                return results[0]["id"]
+        return None
+
+    def _get_hashtag_media(self, hashtag_id: str) -> list:
+        url = f"{self.BASE_URL}/{hashtag_id}/recent_media"
+        params = {
+            "user_id": self.ig_account_id,
+            "access_token": self.access_token,
+            "fields": "id,caption,permalink,timestamp,media_type,media_url",
+            "limit": 50,
+        }
+
+        response = requests.get(url, params=params, timeout=30)
+        if response.status_code == 200:
+            return response.json().get("data", [])
+        return []
+
+    def _fallback_search(self) -> list:
+        """
+        Fallback using Instaloader for public hashtag search.
+        Note: This is rate-limited and may require login.
+        """
+        new_posts = []
+
+        try:
+            import instaloader
+            loader = instaloader.Instaloader(
+                download_pictures=False,
+                download_videos=False,
+                download_video_thumbnails=False,
+                download_comments=False,
+                save_metadata=False,
+                compress_json=False,
+            )
+
+            for hashtag in self.hashtags[:3]:  # Limit to avoid rate limits
+                try:
+                    hashtag_obj = instaloader.Hashtag.from_name(loader.context, hashtag)
+                    count = 0
+
+                    for post in hashtag_obj.get_posts():
+                        if count >= 20:  # Limit posts per hashtag
+                            break
+
+                        caption = post.caption or ""
+                        if self._matches_keyword(caption) or hashtag == "caraudio":
+                            post_data = {
+                                "platform": "instagram",
+                                "post_id": str(post.mediaid),
+                                "title": caption[:100],
+                                "content": caption[:2000],
+                                "author": post.owner_username or "Unknown",
+                                "url": f"https://www.instagram.com/p/{post.shortcode}/",
+                                "source": f"ig_#{hashtag}_instaloader",
+                            }
+                            saved = self.db.save_post(**post_data)
+                            if saved:
+                                new_posts.append(post_data)
+                                print(f"[Instagram] 🆕 {caption[:60]}...")
+
+                        count += 1
+
+                    print(f"[Instagram] 🔍 Checked #{hashtag} (instaloader)")
+
+                except Exception as e:
+                    print(f"[Instagram] ⚠️ Instaloader error for #{hashtag}: {e}")
+
+        except ImportError:
+            print("[Instagram] ⚠️ Instaloader not installed. Run: pip install instaloader")
+
+        return new_posts
+```
+
+### `notifier.py`
+```python
+import smtplib
+import json
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from datetime import datetime
+from config import Config
+
+
+class Notifier:
+    def __init__(self):
+        self.discord_url = Config.DISCORD_WEBHOOK_URL
+        self.email_configured = all([
+            Config.EMAIL_SENDER,
+            Config.EMAIL_PASSWORD,
+            Config.EMAIL_RECIPIENT,
+        ])
+
+    def notify(self, posts: list):
+        """Send notifications for new posts."""
+        if not posts:
+            return
+
+        # Console output
+        self._print_posts(posts)
+
+        # Discord webhook
+        if self.discord_url:
+            self._send_discord(posts)
+
+        # Email digest
+        if self.email_configured and len(posts) > 0:
+            self._send_email(posts)
+
+    def _print_posts(self, posts: list):
+        print("\n" + "=" * 70)
+        print(f"📢 {len(posts)} NEW 'CAR AUDIO' POSTS FOUND - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print("=" * 70)
+
+        for post in posts:
+            platform_emoji = {
+                "reddit": "🟠",
+                "reddit_comment": "💬",
+                "facebook": "🔵",
+                "instagram": "🟣",
+            }.get(post["platform"], "📝")
+
+            print(f"\n{platform_emoji} [{post['platform'].upper()}] {post['source']}")
+            print(f"   📌 {post['title'][:100]}")
+            print(f"   👤 {post['author']}")
+            print(f"   🔗 {post['url']}")
+            if post.get("content"):
+                print(f"   📄 {post['content'][:150]}...")
+            print("-" * 50)
+
+    def _send_discord(self, posts: list):
+        """Send posts to Discord webhook."""
+        try:
+            import requests
+
+            for post in posts[:10]:  # Limit to avoid spam
+                platform_emoji = {
+                    "reddit": "🟠",
+                    "reddit_comment": "💬",
+                    "facebook": "🔵",
+                    "instagram": "🟣",
+                }.get(post["platform"], "📝")
+
+                embed = {
+                    "embeds": [{
+                        "title": f"{platform_emoji} {post['title'][:256]}",
+                        "description": (post.get("content", "")[:1000] or "No content"),
+                        "url": post["url"],
+                        "color": {
+                            "reddit": 0xFF4500,
+                            "reddit_comment": 0xFF6347,
+                            "facebook": 0x1877F2,
+                            "instagram": 0xE1306C,
+                        }.get(post["platform"], 0x808080),
+                        "fields": [
+                            {"name": "Platform", "value": post["platform"].upper(), "inline": True},
+                            {"name": "Author", "value": post["author"], "inline": True},
+                            {"name": "Source", "value": post["source"], "inline": True},
+                        ],
+                        "timestamp": datetime.utcnow().isoformat(),
+                        "footer": {"text": "Car Audio Monitor Bot"},
+                    }]
+                }
+
+                response = requests.post(
+                    self.discord_url,
+                    json=embed,
+                    timeout=10,
+                )
+                if response.status_code not in [200, 204]:
+                    print(f"[Discord] ⚠️ Webhook error: {response.status_code}")
+
+            print(f"[Discord] ✅ Sent {min(len(posts), 10)} notifications")
+
+        except Exception as e:
+            print(f"[Discord] ❌ Error: {e}")
+
+    def _send_email(self, posts: list):
+        """Send email digest of new posts."""
+        try:
+            msg = MIMEMultipart("alternative")
+            msg["Subject"] = f"🔊 Car Audio Monitor: {len(posts)} new posts found"
+            msg["From"] = Config.EMAIL_SENDER
+            msg["To"] = Config.EMAIL_RECIPIENT
+
+            # Build HTML email
+            html = self._build_email_html(posts)
+            msg.attach(MIMEText(html, "html"))
+
+            with smtplib.SMTP(Config.SMTP_SERVER, Config.SMTP_PORT) as server:
+                server.starttls()
+                server.login(Config.EMAIL_SENDER, Config.EMAIL_PASSWORD)
+                server.send_message(msg)
+
+            print(f"[Email] ✅ Digest sent to {Config.EMAIL_RECIPIENT}")
+
+        except Exception as e:
+            print(f"[Email] ❌ Error: {e}")
+
+    def _build_email_html(self, posts: list) -> str:
+        rows = ""
+        for post in posts:
+            rows += f"""
+            <tr>
+                <td style="padding:10px; border-bottom:1px solid #eee;">
+                    <strong>{post['platform'].upper()}</strong><br>
+                    <small>{post['source']}</small>
+                </td>
+                <td style="padding:10px; border-bottom:1px solid #eee;">
+                    <a href="{post['url']}">{post['title'][:100]}</a><br>
+                    <small>by {post['author']}</small><br>
+                    <p style="color:#666; font-size:12px;">{(post.get('content', '') or '')[:200]}...</p>
+                </td>
+            </tr>
+            """
+
+        return f"""
+        <html>
+        <body style="font-family: Arial, sans-serif;">
+            <h2>🔊 Car Audio Monitor Report</h2>
+            <p>Found <strong>{len(posts)}</strong> new posts containing "car audio"</p>
+            <p>Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+            <table style="width:100%; border-collapse:collapse;">
+                <tr style="background:#f5f5f5;">
+                    <th style="padding:10px; text-align:left;">Platform</th>
+                    <th style="padding:10px; text-align:left;">Post</th>
+                </tr>
+                {rows}
+            </table>
+        </body>
+        </html>
+        """
+```
+
+### `main.py`
+```python
+#!/usr/bin/env python3
+"""
+Car Audio Social Media Monitor Bot
+Watches Reddit, Facebook Groups, and Instagram for "car audio" mentions.
+"""
+
+import time
+import signal
+import sys
+import schedule
+from datetime import datetime
+from colorama import init, Fore, Style
+
+from config import Config
+from database import Database
+from monitors import RedditMonitor, FacebookMonitor, InstagramMonitor
+from notifier import Notifier
+
+# Initialize colorama for colored terminal output
+init()
+
+
+class CarAudioMonitorBot:
+    def __init__(self):
+        self.running = True
+        self.db = Database()
+        self.notifier = Notifier()
+
+        print(f"\n{Fore.CYAN}{'='*60}")
+        print(f"  🔊 CAR AUDIO SOCIAL MEDIA MONITOR BOT")
+        print(f"  Keyword: '{Config.SEARCH_KEYWORD}'")
+        print(f"  Check Interval: {Config.CHECK_INTERVAL} seconds")
+        print(f"{'='*60}{Style.RESET_ALL}\n")
+
+        # Initialize monitors
+        print(f"{Fore.YELLOW}Initializing monitors...{Style.RESET_ALL}")
+        self.reddit_monitor = RedditMonitor(self.db)
+        self.facebook_monitor = FacebookMonitor(self.db)
+        self.instagram_monitor = InstagramMonitor(self.db)
+        print()
+
+        # Handle graceful shutdown
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
+
+    def _signal_handler(self, signum, frame):
+        print(f"\n{Fore.RED}🛑 Shutting down gracefully...{Style.RESET_ALL}")
+        self.running = False
+
+    def run_check(self):
+        """Run a single check across all platforms."""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"\n{Fore.GREEN}🔄 Running check at {timestamp}{Style.RESET_ALL}")
+        print("-" * 50)
+
+        all_new_posts = []
+
+        # Reddit
+        try:
+            reddit_posts = self.reddit_monitor.check_subreddits()
+            all_new_posts.extend(reddit_posts)
+
+            # Optionally check comments too
+            # reddit_comments = self.reddit_monitor.check_comments()
+            # all_new_posts.extend(reddit_comments)
+        except Exception as e:
+            print(f"{Fore.RED}[Reddit] Error: {e}{Style.RESET_ALL}")
+
+        # Facebook
+        try:
+            fb_posts = self.facebook_monitor.check_groups()
+            all_new_posts.extend(fb_posts)
+        except Exception as e:
+            print(f"{Fore.RED}[Facebook] Error: {e}{Style.RESET_ALL}")
+
+        # Instagram
+        try:
+            ig_posts = self.instagram_monitor.check_hashtags()
+            all_new_posts.extend(ig_posts)
+        except Exception as e:
+            print(f"{Fore.RED}[Instagram] Error: {e}{Style.RESET_ALL}")
+
+        # Send notifications for new posts
+        if all_new_posts:
+            self.notifier.notify(all_new_posts)
+        else:
+            print(f"{Fore.YELLOW}No new posts found this cycle.{Style.RESET_ALL}")
+
+        # Print stats
+        stats = self.db.get_stats()
+        print(f"\n{Fore.CYAN}📊 Total posts in database: {stats}{Style.RESET_ALL}")
+        print(f"⏰ Next check in {Config.CHECK_INTERVAL} seconds...")
+
+    def run(self):
+        """Main loop - runs checks on a schedule."""
+        print(f"{Fore.GREEN}🚀 Bot started! Running initial check...{Style.RESET_ALL}")
+
+        # Run initial check immediately
+        self.run_check()
+
+        # Schedule subsequent checks
+        schedule.every(Config.CHECK_INTERVAL).seconds.do(self.run_check)
+
+        while self.running:
+            schedule.run_pending()
+            time.sleep(1)
+
+        print(f"\n{Fore.YELLOW}👋 Bot stopped. Goodbye!{Style.RESET_ALL}")
+
+    def run_once(self):
+        """Run a single check and exit."""
+        print(f"{Fore.GREEN}🚀 Running single check...{Style.RESET_ALL}")
+        self.run_check()
+        print(f"\n{Fore.YELLOW}✅ Single check complete.{Style.RESET_ALL}")
+
+    def show_recent(self, limit=20):
+        """Display recent posts from database."""
+        posts = self.db.get_recent_posts(limit)
+        print(f"\n{Fore.CYAN}📋 Last {limit} posts:{Style.RESET_ALL}\n")
+        for post in posts:
+            print(f"  [{post['platform'].upper()}] {post['title'][:80]}")
+            print(f"    🔗 {post['url']}")
+            print(f"    📅 {post['found_at']}")
+            print()
+
+
+def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Car Audio Social Media Monitor Bot")
+    parser.add_argument(
+        "--mode",
+        choices=["monitor", "once", "recent"],
+        default="monitor",
+        help="Run mode: 'monitor' (continuous), 'once' (single check), 'recent' (show recent posts)"
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=20,
+        help="Number of recent posts to show (for 'recent' mode)"
+    )
+
+    args = parser.parse_args()
+
+    bot = CarAudioMonitorBot()
+
+    if args.mode == "monitor":
+        bot.run()
+    elif args.mode == "once":
+        bot.run_once()
+    elif args.mode == "recent":
+        bot.show_recent(args.limit)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+### `README.md`
+```markdown
+# 🔊 Car Audio Social Media Monitor Bot
+
+Monitors Reddit, Facebook Groups, and Instagram for posts containing "car audio".
+
+## Setup
+
+### 1. Install Dependencies
+```bash
+pip install -r requirements.txt
+```
+
+### 2. Configure API Credentials
+
+Copy `.env.example` to `.env` and fill in your credentials:
+
+#### Reddit (Easiest to set up)
+1. Go to https://www.reddit.com/prefs/apps
+2. Create a "script" application
+3. Copy the client ID and secret to `.env`
+
+#### Facebook (Requires App Review)
+1. Create an app at https://developers.facebook.com/
+2. Request `groups_access_member_info` permission
+3. Generate a long-lived access token
+4. Add group IDs to `config.py`
+
+#### Instagram (Via Facebook Graph API)
+1. Link Instagram Business account to a Facebook Page
+2. Use Facebook's Graph API with `instagram_basic` permissions
+3. Or: Use the Instaloader fallback (limited, no API needed)
+
+#### Notifications (Optional)
+- **Discord**: Create a webhook in your Discord server settings
+- **Email**: Use Gmail with an App Password
+
+### 3. Run the Bot
+
+```bash
+# Continuous monitoring
+python main.py --mode monitor
+
+# Single check
+python main.py --mode once
+
+# View recent posts
+python main.py --mode recent --limit 50
+```
+
+## Features
+
+- ✅ Reddit monitoring (subreddits + global search)
+- ✅ Facebook Group monitoring (via Graph API)
+- ✅ Instagram hashtag monitoring (Graph API + Instaloader fallback)
+- ✅ SQLite database for deduplication
+- ✅ Discord webhook notifications
+- ✅ Email digest notifications
+- ✅ Colored terminal output
+- ✅ Configurable check intervals
+- ✅ Graceful shutdown (Ctrl+C)
+
+## API Limitations
+
+| Platform  | Difficulty | Notes |
+|-----------|-----------|-------|
+| Reddit    | Easy      | Free API, generous rate limits |
+| Facebook  | Hard      | Requires app review for group access |
+| Instagram | Medium    | Requires business account + Facebook link |
+
+## Customization
+
+Edit `config.py` to:
+- Change the search keyword
+- Add/remove subreddits
+- Add Facebook group IDs
+- Change Instagram hashtags
+- Adjust check interval
+```
+
+## Quick Start
+
+The fastest way to get started is with **Reddit only** (easiest API to set up):
+
+1. Get Reddit API credentials from https://www.reddit.com/prefs/apps
+2. Fill in `REDDIT_CLIENT_ID` and `REDDIT_CLIENT_SECRET` in `.env`
+3. Run `python main.py --mode once`
+
+The bot will gracefully skip Facebook and Instagram if those APIs aren't configured, so you can add them later.
