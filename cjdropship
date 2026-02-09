@@ -1,0 +1,1706 @@
+
+
+# CJDropshipping Product Price Watcher
+
+A complete bot that monitors product prices on CJDropshipping and alerts you when prices change.
+
+---
+
+## Project Structure
+
+```
+cj_price_watcher/
+├── .env
+├── config.py
+├── main.py
+├── cj_api.py
+├── database.py
+├── notifier.py
+├── price_analyzer.py
+├── products.json
+└── requirements.txt
+```
+
+---
+
+## 1. `requirements.txt`
+
+```txt
+requests>=2.31.0
+python-dotenv>=1.0.0
+rich>=13.7.0
+schedule>=1.2.0
+```
+
+---
+
+## 2. `.env`
+
+```env
+# ============================================
+# CJDropshipping API Credentials
+# Get from: https://developers.cjdropshipping.com/
+# ============================================
+CJ_API_EMAIL=your_email@example.com
+CJ_API_KEY=your_api_key_here
+
+# ============================================
+# Notification Settings (all optional)
+# ============================================
+
+# Discord
+DISCORD_WEBHOOK_URL=
+
+# Email
+EMAIL_SENDER=
+EMAIL_PASSWORD=
+EMAIL_RECIPIENT=
+SMTP_SERVER=smtp.gmail.com
+SMTP_PORT=587
+
+# Telegram
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
+
+# ============================================
+# Watcher Settings
+# ============================================
+
+# How often to check prices (in seconds)
+CHECK_INTERVAL=1800
+
+# Minimum price change % to trigger alert
+MIN_CHANGE_PERCENT=1.0
+
+# Alert on ANY change regardless of threshold
+ALERT_ON_ANY_CHANGE=false
+
+# Track variant-level pricing
+TRACK_VARIANTS=true
+
+# Currency for display
+CURRENCY=USD
+```
+
+---
+
+## 3. `config.py`
+
+```python
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+class Config:
+    # CJ API
+    CJ_API_EMAIL = os.getenv("CJ_API_EMAIL", "")
+    CJ_API_KEY = os.getenv("CJ_API_KEY", "")
+    CJ_BASE_URL = "https://developers.cjdropshipping.com/api/v1"
+
+    # Notifications
+    DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
+    EMAIL_SENDER = os.getenv("EMAIL_SENDER", "")
+    EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD", "")
+    EMAIL_RECIPIENT = os.getenv("EMAIL_RECIPIENT", "")
+    SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com")
+    SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+    TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+    # Watcher
+    CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "1800"))
+    MIN_CHANGE_PERCENT = float(os.getenv("MIN_CHANGE_PERCENT", "1.0"))
+    ALERT_ON_ANY_CHANGE = os.getenv("ALERT_ON_ANY_CHANGE", "false").lower() == "true"
+    TRACK_VARIANTS = os.getenv("TRACK_VARIANTS", "true").lower() == "true"
+    CURRENCY = os.getenv("CURRENCY", "USD")
+
+    # Database
+    DB_PATH = "price_history.db"
+    PRODUCTS_FILE = "products.json"
+```
+
+---
+
+## 4. `products.json`
+
+```json
+{
+  "products": [
+    {
+      "id": "YOUR_CJ_PRODUCT_ID_1",
+      "name": "Bluetooth Car Speaker",
+      "notes": "Main product - best seller"
+    },
+    {
+      "id": "YOUR_CJ_PRODUCT_ID_2",
+      "name": "Car Phone Mount",
+      "notes": "Backup supplier option"
+    },
+    {
+      "id": "YOUR_CJ_PRODUCT_ID_3",
+      "name": "LED Interior Lights",
+      "notes": "Seasonal item"
+    },
+    {
+      "id": "YOUR_CJ_PRODUCT_ID_4",
+      "name": "Dash Camera 4K",
+      "notes": "High ticket item - watch closely"
+    }
+  ],
+  "_instructions": {
+    "finding_product_ids": [
+      "1. Go to CJDropshipping.com and find your product",
+      "2. The product ID is in the URL: cjdropshipping.com/product/PRODUCT_ID.html",
+      "3. Or use the CJ API product search endpoint",
+      "4. You can also use SKU IDs instead"
+    ],
+    "supported_id_types": [
+      "pid  - CJ Product ID (from URL or API)",
+      "sku  - CJ SKU ID for specific variants"
+    ]
+  }
+}
+```
+
+---
+
+## 5. `database.py`
+
+```python
+import sqlite3
+import json
+from datetime import datetime, timedelta
+from config import Config
+
+
+class Database:
+    def __init__(self):
+        self.db_path = Config.DB_PATH
+        self._init_db()
+
+    def _connect(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        return conn
+
+    def _init_db(self):
+        conn = self._connect()
+        cursor = conn.cursor()
+
+        # Main price history table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS price_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                product_id TEXT NOT NULL,
+                product_name TEXT,
+                variant_id TEXT DEFAULT 'base',
+                variant_name TEXT DEFAULT 'Base Product',
+                sell_price REAL,
+                original_price REAL,
+                member_price REAL,
+                shipping_price REAL,
+                total_cost REAL,
+                currency TEXT DEFAULT 'USD',
+                stock_status TEXT,
+                stock_quantity INTEGER DEFAULT 0,
+                raw_data TEXT,
+                checked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Price change events
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS price_changes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                product_id TEXT NOT NULL,
+                product_name TEXT,
+                variant_id TEXT DEFAULT 'base',
+                variant_name TEXT DEFAULT 'Base Product',
+                old_price REAL,
+                new_price REAL,
+                price_diff REAL,
+                percent_change REAL,
+                change_type TEXT,
+                detected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Product metadata
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS products (
+                product_id TEXT PRIMARY KEY,
+                product_name TEXT,
+                category TEXT,
+                supplier TEXT,
+                first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_checked TIMESTAMP,
+                notes TEXT,
+                active INTEGER DEFAULT 1
+            )
+        """)
+
+        # Indexes for performance
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_price_history_product
+            ON price_history(product_id, variant_id, checked_at)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_price_changes_product
+            ON price_changes(product_id, detected_at)
+        """)
+
+        conn.commit()
+        conn.close()
+
+    def get_last_price(self, product_id: str, variant_id: str = "base") -> dict | None:
+        """Get the most recent price record for a product/variant."""
+        conn = self._connect()
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT * FROM price_history
+            WHERE product_id = ? AND variant_id = ?
+            ORDER BY checked_at DESC
+            LIMIT 1
+        """, (product_id, variant_id))
+
+        row = cursor.fetchone()
+        conn.close()
+
+        if row:
+            return dict(row)
+        return None
+
+    def save_price(self, price_data: dict):
+        """Save a price snapshot."""
+        conn = self._connect()
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            INSERT INTO price_history (
+                product_id, product_name, variant_id, variant_name,
+                sell_price, original_price, member_price,
+                shipping_price, total_cost, currency,
+                stock_status, stock_quantity, raw_data
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            price_data["product_id"],
+            price_data.get("product_name", ""),
+            price_data.get("variant_id", "base"),
+            price_data.get("variant_name", "Base Product"),
+            price_data.get("sell_price", 0),
+            price_data.get("original_price", 0),
+            price_data.get("member_price", 0),
+            price_data.get("shipping_price", 0),
+            price_data.get("total_cost", 0),
+            price_data.get("currency", Config.CURRENCY),
+            price_data.get("stock_status", "unknown"),
+            price_data.get("stock_quantity", 0),
+            json.dumps(price_data.get("raw_data", {})),
+        ))
+
+        # Update products table
+        cursor.execute("""
+            INSERT INTO products (product_id, product_name, last_checked)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(product_id) DO UPDATE SET
+                product_name = excluded.product_name,
+                last_checked = CURRENT_TIMESTAMP
+        """, (
+            price_data["product_id"],
+            price_data.get("product_name", ""),
+        ))
+
+        conn.commit()
+        conn.close()
+
+    def save_price_change(self, change_data: dict):
+        """Record a price change event."""
+        conn = self._connect()
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            INSERT INTO price_changes (
+                product_id, product_name, variant_id, variant_name,
+                old_price, new_price, price_diff, percent_change,
+                change_type
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            change_data["product_id"],
+            change_data.get("product_name", ""),
+            change_data.get("variant_id", "base"),
+            change_data.get("variant_name", "Base Product"),
+            change_data["old_price"],
+            change_data["new_price"],
+            change_data["price_diff"],
+            change_data["percent_change"],
+            change_data["change_type"],
+        ))
+
+        conn.commit()
+        conn.close()
+
+    def get_price_history(
+        self, product_id: str, variant_id: str = "base", days: int = 30
+    ) -> list:
+        """Get price history for a product over N days."""
+        conn = self._connect()
+        cursor = conn.cursor()
+
+        since = (datetime.utcnow() - timedelta(days=days)).isoformat()
+
+        cursor.execute("""
+            SELECT * FROM price_history
+            WHERE product_id = ? AND variant_id = ?
+            AND checked_at >= ?
+            ORDER BY checked_at ASC
+        """, (product_id, variant_id, since))
+
+        rows = [dict(r) for r in cursor.fetchall()]
+        conn.close()
+        return rows
+
+    def get_recent_changes(self, days: int = 7, limit: int = 50) -> list:
+        """Get recent price changes across all products."""
+        conn = self._connect()
+        cursor = conn.cursor()
+
+        since = (datetime.utcnow() - timedelta(days=days)).isoformat()
+
+        cursor.execute("""
+            SELECT * FROM price_changes
+            WHERE detected_at >= ?
+            ORDER BY detected_at DESC
+            LIMIT ?
+        """, (since, limit))
+
+        rows = [dict(r) for r in cursor.fetchall()]
+        conn.close()
+        return rows
+
+    def get_all_products_summary(self) -> list:
+        """Get latest price for all tracked products."""
+        conn = self._connect()
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT ph.*, p.notes, p.first_seen
+            FROM price_history ph
+            INNER JOIN (
+                SELECT product_id, variant_id, MAX(checked_at) as max_date
+                FROM price_history
+                GROUP BY product_id, variant_id
+            ) latest ON ph.product_id = latest.product_id
+                AND ph.variant_id = latest.variant_id
+                AND ph.checked_at = latest.max_date
+            LEFT JOIN products p ON ph.product_id = p.product_id
+            ORDER BY ph.product_name
+        """)
+
+        rows = [dict(r) for r in cursor.fetchall()]
+        conn.close()
+        return rows
+
+    def get_price_stats(self, product_id: str, variant_id: str = "base") -> dict:
+        """Get min/max/avg price stats for a product."""
+        conn = self._connect()
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT
+                MIN(sell_price) as min_price,
+                MAX(sell_price) as max_price,
+                AVG(sell_price) as avg_price,
+                COUNT(*) as data_points,
+                MIN(checked_at) as first_tracked,
+                MAX(checked_at) as last_tracked
+            FROM price_history
+            WHERE product_id = ? AND variant_id = ?
+            AND sell_price > 0
+        """, (product_id, variant_id))
+
+        row = cursor.fetchone()
+        conn.close()
+
+        if row:
+            return dict(row)
+        return {}
+```
+
+---
+
+## 6. `cj_api.py`
+
+```python
+import time
+import requests
+from datetime import datetime, timedelta
+from config import Config
+
+
+class CJDropshippingAPI:
+    """
+    CJ Dropshipping API Client
+    Docs: https://developers.cjdropshipping.com/api2.0/v1/documentation
+    """
+
+    def __init__(self):
+        self.base_url = Config.CJ_BASE_URL
+        self.email = Config.CJ_API_EMAIL
+        self.api_key = Config.CJ_API_KEY
+        self.access_token = None
+        self.token_expiry = None
+        self.session = requests.Session()
+        self.session.headers.update({
+            "Content-Type": "application/json",
+        })
+        self._rate_limit_delay = 1.0  # seconds between requests
+
+    def _ensure_token(self):
+        """Get or refresh the access token."""
+        if self.access_token and self.token_expiry and datetime.utcnow() < self.token_expiry:
+            return
+
+        print("[CJ API] 🔑 Requesting access token...")
+
+        try:
+            response = self.session.post(
+                f"{self.base_url}/authentication/getAccessToken",
+                json={
+                    "email": self.email,
+                    "password": self.api_key,
+                },
+                timeout=30,
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            if data.get("result") and data.get("data"):
+                self.access_token = data["data"].get("accessToken")
+                # Token typically valid for ~24h; refresh at 23h
+                self.token_expiry = datetime.utcnow() + timedelta(hours=23)
+                self.session.headers["CJ-Access-Token"] = self.access_token
+                print("[CJ API] ✅ Token obtained successfully")
+            else:
+                raise Exception(f"Token request failed: {data.get('message', 'Unknown error')}")
+
+        except requests.exceptions.RequestException as e:
+            raise Exception(f"Failed to get CJ access token: {e}")
+
+    def _request(self, method: str, endpoint: str, **kwargs) -> dict:
+        """Make an authenticated API request with rate limiting."""
+        self._ensure_token()
+        time.sleep(self._rate_limit_delay)
+
+        url = f"{self.base_url}{endpoint}"
+
+        try:
+            response = self.session.request(method, url, timeout=30, **kwargs)
+            response.raise_for_status()
+            data = response.json()
+
+            if not data.get("result"):
+                print(f"[CJ API] ⚠️ API returned error: {data.get('message', 'Unknown')}")
+
+            return data
+
+        except requests.exceptions.HTTPError as e:
+            if response.status_code == 429:
+                print("[CJ API] ⏳ Rate limited. Waiting 60 seconds...")
+                time.sleep(60)
+                return self._request(method, endpoint, **kwargs)
+            raise Exception(f"CJ API HTTP error: {e}")
+
+        except requests.exceptions.RequestException as e:
+            raise Exception(f"CJ API request failed: {e}")
+
+    def get_product_detail(self, product_id: str) -> dict | None:
+        """
+        Fetch full product details including price and variants.
+
+        GET /product/query?pid={product_id}
+        """
+        try:
+            data = self._request(
+                "GET",
+                f"/product/query",
+                params={"pid": product_id},
+            )
+
+            if data.get("result") and data.get("data"):
+                return self._parse_product(data["data"])
+
+            print(f"[CJ API] ⚠️ No data for product {product_id}")
+            return None
+
+        except Exception as e:
+            print(f"[CJ API] ❌ Error fetching product {product_id}: {e}")
+            return None
+
+    def get_product_variants(self, product_id: str) -> list:
+        """
+        Get all variants/SKUs for a product.
+
+        GET /product/query?pid={product_id}
+        Variants are nested in the product response.
+        """
+        try:
+            data = self._request(
+                "GET",
+                f"/product/query",
+                params={"pid": product_id},
+            )
+
+            if data.get("result") and data.get("data"):
+                return self._parse_variants(data["data"])
+
+            return []
+
+        except Exception as e:
+            print(f"[CJ API] ❌ Error fetching variants for {product_id}: {e}")
+            return []
+
+    def search_products(self, keyword: str, page: int = 1, limit: int = 20) -> list:
+        """
+        Search for products by keyword.
+
+        GET /product/list
+        """
+        try:
+            data = self._request(
+                "GET",
+                "/product/list",
+                params={
+                    "productNameEn": keyword,
+                    "pageNum": page,
+                    "pageSize": limit,
+                },
+            )
+
+            if data.get("result") and data.get("data"):
+                products = data["data"].get("list", [])
+                return [self._parse_product(p) for p in products]
+
+            return []
+
+        except Exception as e:
+            print(f"[CJ API] ❌ Search error: {e}")
+            return []
+
+    def get_shipping_estimate(
+        self,
+        product_id: str,
+        country_code: str = "US",
+        quantity: int = 1,
+    ) -> dict | None:
+        """
+        Get shipping cost estimate for a product.
+
+        POST /logistic/freightCalculate
+        """
+        try:
+            data = self._request(
+                "POST",
+                "/logistic/freightCalculate",
+                json={
+                    "startCountryCode": "CN",
+                    "endCountryCode": country_code,
+                    "products": [{
+                        "quantity": quantity,
+                        "pid": product_id,
+                    }],
+                },
+            )
+
+            if data.get("result") and data.get("data"):
+                shipping_options = data["data"]
+                if shipping_options:
+                    # Return cheapest option
+                    cheapest = min(
+                        shipping_options,
+                        key=lambda x: float(x.get("logisticPrice", 999)),
+                    )
+                    return {
+                        "method": cheapest.get("logisticName", "Unknown"),
+                        "price": float(cheapest.get("logisticPrice", 0)),
+                        "days_min": cheapest.get("logisticAging", ""),
+                        "currency": Config.CURRENCY,
+                    }
+
+            return None
+
+        except Exception as e:
+            print(f"[CJ API] ❌ Shipping estimate error: {e}")
+            return None
+
+    def _parse_product(self, raw: dict) -> dict:
+        """Parse raw API product data into standardized format."""
+
+        sell_price = float(raw.get("sellPrice", 0) or 0)
+        original_price = float(raw.get("productPrice", 0) or 0)
+
+        # CJ sometimes uses different field names
+        if sell_price == 0:
+            sell_price = float(raw.get("sourcePrice", 0) or 0)
+        if sell_price == 0:
+            sell_price = float(raw.get("price", 0) or 0)
+
+        product = {
+            "product_id": raw.get("pid", raw.get("productId", "")),
+            "product_name": raw.get("productNameEn", raw.get("productName", "Unknown")),
+            "sell_price": sell_price,
+            "original_price": original_price,
+            "member_price": float(raw.get("memberPrice", 0) or 0),
+            "category": raw.get("categoryName", raw.get("categoryId", "")),
+            "image_url": raw.get("productImage", ""),
+            "product_url": self._build_product_url(raw.get("pid", "")),
+            "stock_status": "in_stock" if raw.get("status") == "ON_SALE" else "unknown",
+            "supplier": raw.get("supplierName", "CJ"),
+            "variants": [],
+            "raw_data": raw,
+        }
+
+        # Parse variants if present
+        variants = raw.get("variants", []) or raw.get("variantList", [])
+        if variants:
+            product["variants"] = self._parse_variants(raw)
+
+        return product
+
+    def _parse_variants(self, raw: dict) -> list:
+        """Parse product variants from raw data."""
+        variants = []
+        variant_list = raw.get("variants", []) or raw.get("variantList", [])
+
+        for v in variant_list:
+            variant = {
+                "variant_id": v.get("vid", v.get("variantId", "")),
+                "variant_name": self._build_variant_name(v),
+                "sku": v.get("variantSku", ""),
+                "sell_price": float(v.get("variantSellPrice", 0) or 0),
+                "original_price": float(v.get("variantPrice", 0) or 0),
+                "member_price": float(v.get("variantMemberPrice", 0) or 0),
+                "stock_quantity": int(v.get("variantStock", 0) or 0),
+                "stock_status": (
+                    "in_stock" if int(v.get("variantStock", 0) or 0) > 0
+                    else "out_of_stock"
+                ),
+                "image_url": v.get("variantImage", ""),
+            }
+
+            # Fallback prices
+            if variant["sell_price"] == 0:
+                variant["sell_price"] = float(v.get("variantCost", 0) or 0)
+
+            variants.append(variant)
+
+        return variants
+
+    def _build_variant_name(self, variant: dict) -> str:
+        """Build a human-readable variant name from properties."""
+        props = []
+
+        # Common variant property fields
+        for key in ["variantProperty", "variantNameEn", "variantAttr"]:
+            val = variant.get(key, "")
+            if val:
+                props.append(str(val))
+
+        if props:
+            return " / ".join(props)
+
+        # Fallback to SKU
+        return variant.get("variantSku", "Default")
+
+    def _build_product_url(self, product_id: str) -> str:
+        """Build CJ product page URL."""
+        if product_id:
+            return f"https://cjdropshipping.com/product/{product_id}.html"
+        return ""
+
+    def test_connection(self) -> bool:
+        """Test API connectivity and credentials."""
+        try:
+            self._ensure_token()
+            print("[CJ API] ✅ Connection successful!")
+            return True
+        except Exception as e:
+            print(f"[CJ API] ❌ Connection failed: {e}")
+            return False
+```
+
+---
+
+## 7. `price_analyzer.py`
+
+```python
+from config import Config
+
+
+class PriceAnalyzer:
+    """Compares prices and determines if changes are significant."""
+
+    def __init__(self):
+        self.min_change_percent = Config.MIN_CHANGE_PERCENT
+        self.alert_on_any = Config.ALERT_ON_ANY_CHANGE
+
+    def compare_prices(
+        self,
+        product_id: str,
+        product_name: str,
+        variant_id: str,
+        variant_name: str,
+        old_price: float,
+        new_price: float,
+    ) -> dict | None:
+        """
+        Compare old vs new price and return change details
+        if the change is significant enough.
+        Returns None if no significant change.
+        """
+
+        if old_price is None or old_price == 0:
+            # First time tracking - no comparison to make
+            return None
+
+        if old_price == new_price:
+            return None
+
+        price_diff = new_price - old_price
+        percent_change = ((new_price - old_price) / old_price) * 100
+
+        # Determine change type
+        if new_price < old_price:
+            change_type = "PRICE_DROP"
+        else:
+            change_type = "PRICE_INCREASE"
+
+        # Check if change exceeds threshold
+        if not self.alert_on_any:
+            if abs(percent_change) < self.min_change_percent:
+                return None
+
+        return {
+            "product_id": product_id,
+            "product_name": product_name,
+            "variant_id": variant_id,
+            "variant_name": variant_name,
+            "old_price": round(old_price, 2),
+            "new_price": round(new_price, 2),
+            "price_diff": round(price_diff, 2),
+            "percent_change": round(percent_change, 2),
+            "change_type": change_type,
+        }
+
+    def analyze_trend(self, price_history: list) -> dict:
+        """
+        Analyze price trend from historical data.
+        Returns trend information.
+        """
+        if len(price_history) < 2:
+            return {"trend": "insufficient_data", "data_points": len(price_history)}
+
+        prices = [
+            h["sell_price"] for h in price_history
+            if h.get("sell_price", 0) > 0
+        ]
+
+        if len(prices) < 2:
+            return {"trend": "insufficient_data", "data_points": len(prices)}
+
+        current = prices[-1]
+        first = prices[0]
+        highest = max(prices)
+        lowest = min(prices)
+        average = sum(prices) / len(prices)
+
+        # Simple trend detection
+        recent_avg = sum(prices[-5:]) / len(prices[-5:]) if len(prices) >= 5 else current
+        older_avg = sum(prices[:5]) / len(prices[:5]) if len(prices) >= 5 else first
+
+        if recent_avg > older_avg * 1.02:
+            trend = "rising"
+        elif recent_avg < older_avg * 0.98:
+            trend = "falling"
+        else:
+            trend = "stable"
+
+        overall_change = ((current - first) / first) * 100 if first > 0 else 0
+
+        return {
+            "trend": trend,
+            "current_price": round(current, 2),
+            "first_price": round(first, 2),
+            "highest_price": round(highest, 2),
+            "lowest_price": round(lowest, 2),
+            "average_price": round(average, 2),
+            "overall_change_percent": round(overall_change, 2),
+            "data_points": len(prices),
+            "is_at_lowest": current <= lowest,
+            "is_at_highest": current >= highest,
+        }
+
+    def generate_summary_report(self, all_products_data: list) -> str:
+        """Generate a text summary of all tracked products."""
+        lines = []
+        lines.append("=" * 60)
+        lines.append("📊  PRICE TRACKING SUMMARY REPORT")
+        lines.append("=" * 60)
+
+        for item in all_products_data:
+            emoji = "🟢" if item.get("trend") == "falling" else (
+                "🔴" if item.get("trend") == "rising" else "⚪"
+            )
+
+            lines.append(f"\n{emoji} {item['product_name']}")
+            lines.append(f"   Current: ${item['current_price']:.2f}")
+
+            if item.get("first_price"):
+                lines.append(f"   Started: ${item['first_price']:.2f}")
+                lines.append(f"   Change:  {item['overall_change_percent']:+.1f}%")
+
+            if item.get("lowest_price"):
+                lines.append(f"   Range:   ${item['lowest_price']:.2f} - ${item['highest_price']:.2f}")
+
+            if item.get("is_at_lowest"):
+                lines.append(f"   ⭐ AT ALL-TIME LOW!")
+            elif item.get("is_at_highest"):
+                lines.append(f"   ⚠️  AT ALL-TIME HIGH!")
+
+        lines.append("\n" + "=" * 60)
+        return "\n".join(lines)
+```
+
+---
+
+## 8. `notifier.py`
+
+```python
+import smtplib
+import requests
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from datetime import datetime
+from config import Config
+
+
+class Notifier:
+    def __init__(self):
+        self.discord_url = Config.DISCORD_WEBHOOK_URL
+        self.email_configured = all([
+            Config.EMAIL_SENDER,
+            Config.EMAIL_PASSWORD,
+            Config.EMAIL_RECIPIENT,
+        ])
+        self.telegram_configured = all([
+            Config.TELEGRAM_BOT_TOKEN,
+            Config.TELEGRAM_CHAT_ID,
+        ])
+
+    def notify_price_changes(self, changes: list):
+        """Send notifications for all price changes."""
+        if not changes:
+            return
+
+        self._print_changes(changes)
+
+        if self.discord_url:
+            self._send_discord(changes)
+
+        if self.email_configured:
+            self._send_email(changes)
+
+        if self.telegram_configured:
+            self._send_telegram(changes)
+
+    def notify_stock_change(self, product_name: str, old_status: str, new_status: str):
+        """Alert when stock status changes."""
+        message = f"📦 Stock Change: {product_name}\n{old_status} → {new_status}"
+        print(f"\n{message}")
+
+        if self.discord_url:
+            try:
+                requests.post(
+                    self.discord_url,
+                    json={"content": message},
+                    timeout=10,
+                )
+            except Exception:
+                pass
+
+    def _print_changes(self, changes: list):
+        """Print price changes to console."""
+        print("\n" + "=" * 70)
+        print(f"💰  {len(changes)} PRICE CHANGE(S) DETECTED!")
+        print(f"    {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print("=" * 70)
+
+        for c in changes:
+            if c["change_type"] == "PRICE_DROP":
+                emoji = "📉🟢"
+                direction = "DROPPED"
+            else:
+                emoji = "📈🔴"
+                direction = "INCREASED"
+
+            print(f"\n{emoji} {c['product_name']}")
+
+            if c["variant_id"] != "base":
+                print(f"   Variant: {c['variant_name']}")
+
+            print(f"   Price {direction}: ${c['old_price']:.2f} → ${c['new_price']:.2f}")
+            print(f"   Change: {c['price_diff']:+.2f} ({c['percent_change']:+.1f}%)")
+
+        print("\n" + "=" * 70)
+
+    def _send_discord(self, changes: list):
+        """Send to Discord via webhook."""
+        try:
+            for change in changes[:10]:
+                if change["change_type"] == "PRICE_DROP":
+                    color = 0x00FF00  # Green
+                    emoji = "📉"
+                    title = f"{emoji} Price DROP: {change['product_name']}"
+                else:
+                    color = 0xFF0000  # Red
+                    emoji = "📈"
+                    title = f"{emoji} Price INCREASE: {change['product_name']}"
+
+                fields = [
+                    {
+                        "name": "Old Price",
+                        "value": f"${change['old_price']:.2f}",
+                        "inline": True,
+                    },
+                    {
+                        "name": "New Price",
+                        "value": f"${change['new_price']:.2f}",
+                        "inline": True,
+                    },
+                    {
+                        "name": "Change",
+                        "value": f"{change['price_diff']:+.2f} ({change['percent_change']:+.1f}%)",
+                        "inline": True,
+                    },
+                ]
+
+                if change["variant_id"] != "base":
+                    fields.append({
+                        "name": "Variant",
+                        "value": change["variant_name"],
+                        "inline": False,
+                    })
+
+                embed = {
+                    "embeds": [{
+                        "title": title,
+                        "color": color,
+                        "fields": fields,
+                        "footer": {
+                            "text": f"CJ Price Watcher | {datetime.now().strftime('%H:%M:%S')}",
+                        },
+                    }]
+                }
+
+                requests.post(self.discord_url, json=embed, timeout=10)
+
+            print(f"[Discord] ✅ Sent {min(len(changes), 10)} alerts")
+
+        except Exception as e:
+            print(f"[Discord] ❌ Error: {e}")
+
+    def _send_email(self, changes: list):
+        """Send email alert."""
+        try:
+            msg = MIMEMultipart("alternative")
+            msg["Subject"] = f"💰 CJ Price Alert: {len(changes)} change(s) detected"
+            msg["From"] = Config.EMAIL_SENDER
+            msg["To"] = Config.EMAIL_RECIPIENT
+
+            rows = ""
+            for c in changes:
+                color = "#00AA00" if c["change_type"] == "PRICE_DROP" else "#CC0000"
+                arrow = "↓" if c["change_type"] == "PRICE_DROP" else "↑"
+
+                rows += f"""
+                <tr>
+                    <td style="padding:10px;border-bottom:1px solid #eee">
+                        <strong>{c['product_name']}</strong>
+                        {'<br><small>' + c['variant_name'] + '</small>' if c['variant_id'] != 'base' else ''}
+                    </td>
+                    <td style="padding:10px;border-bottom:1px solid #eee;text-align:center">
+                        ${c['old_price']:.2f}
+                    </td>
+                    <td style="padding:10px;border-bottom:1px solid #eee;text-align:center">
+                        <strong>${c['new_price']:.2f}</strong>
+                    </td>
+                    <td style="padding:10px;border-bottom:1px solid #eee;text-align:center;color:{color}">
+                        <strong>{arrow} {c['percent_change']:+.1f}%</strong>
+                    </td>
+                </tr>
+                """
+
+            html = f"""
+            <html>
+            <body style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto">
+                <h2>💰 CJ Dropshipping Price Alert</h2>
+                <p>{len(changes)} price change(s) detected at {datetime.now().strftime('%Y-%m-%d %H:%M')}</p>
+                <table style="width:100%;border-collapse:collapse">
+                    <tr style="background:#f5f5f5">
+                        <th style="padding:10px;text-align:left">Product</th>
+                        <th style="padding:10px">Old Price</th>
+                        <th style="padding:10px">New Price</th>
+                        <th style="padding:10px">Change</th>
+                    </tr>
+                    {rows}
+                </table>
+            </body>
+            </html>
+            """
+
+            msg.attach(MIMEText(html, "html"))
+
+            with smtplib.SMTP(Config.SMTP_SERVER, Config.SMTP_PORT) as server:
+                server.starttls()
+                server.login(Config.EMAIL_SENDER, Config.EMAIL_PASSWORD)
+                server.send_message(msg)
+
+            print(f"[Email] ✅ Alert sent to {Config.EMAIL_RECIPIENT}")
+
+        except Exception as e:
+            print(f"[Email] ❌ Error: {e}")
+
+    def _send_telegram(self, changes: list):
+        """Send via Telegram bot."""
+        try:
+            bot_token = Config.TELEGRAM_BOT_TOKEN
+            chat_id = Config.TELEGRAM_CHAT_ID
+
+            for c in changes[:10]:
+                if c["change_type"] == "PRICE_DROP":
+                    emoji = "📉🟢"
+                    word = "DROPPED"
+                else:
+                    emoji = "📈🔴"
+                    word = "INCREASED"
+
+                text = (
+                    f"{emoji} <b>Price {word}!</b>\n\n"
+                    f"📦 <b>{c['product_name']}</b>\n"
+                )
+
+                if c["variant_id"] != "base":
+                    text += f"🏷 Variant: {c['variant_name']}\n"
+
+                text += (
+                    f"\n💵 ${c['old_price']:.2f} → <b>${c['new_price']:.2f}</b>\n"
+                    f"📊 Change: {c['price_diff']:+.2f} ({c['percent_change']:+.1f}%)"
+                )
+
+                requests.post(
+                    f"https://api.telegram.org/bot{bot_token}/sendMessage",
+                    json={
+                        "chat_id": chat_id,
+                        "text": text,
+                        "parse_mode": "HTML",
+                    },
+                    timeout=10,
+                )
+
+            print(f"[Telegram] ✅ Sent {min(len(changes), 10)} alerts")
+
+        except Exception as e:
+            print(f"[Telegram] ❌ Error: {e}")
+```
+
+---
+
+## 9. `main.py`
+
+```python
+#!/usr/bin/env python3
+"""
+CJDropshipping Product Price Watcher
+Monitors product prices and alerts on changes.
+"""
+
+import json
+import sys
+import time
+import signal
+import argparse
+from datetime import datetime
+from pathlib import Path
+
+from config import Config
+from cj_api import CJDropshippingAPI
+from database import Database
+from price_analyzer import PriceAnalyzer
+from notifier import Notifier
+
+
+class CJPriceWatcher:
+    def __init__(self):
+        self.api = CJDropshippingAPI()
+        self.db = Database()
+        self.analyzer = PriceAnalyzer()
+        self.notifier = Notifier()
+        self.products = self._load_products()
+        self.running = True
+
+        # Graceful shutdown
+        signal.signal(signal.SIGINT, self._shutdown)
+        signal.signal(signal.SIGTERM, self._shutdown)
+
+    def _shutdown(self, signum, frame):
+        print("\n\n🛑 Shutting down gracefully...")
+        self.running = False
+
+    def _load_products(self) -> list:
+        """Load product list from JSON file."""
+        products_file = Path(Config.PRODUCTS_FILE)
+
+        if not products_file.exists():
+            print(f"⚠️  {Config.PRODUCTS_FILE} not found. Creating template...")
+            template = {
+                "products": [
+                    {
+                        "id": "EXAMPLE_PRODUCT_ID",
+                        "name": "Example Product",
+                        "notes": "Replace with real CJ product IDs",
+                    }
+                ]
+            }
+            with open(products_file, "w") as f:
+                json.dump(template, f, indent=2)
+            print(f"📝 Edit {Config.PRODUCTS_FILE} and add your product IDs")
+            sys.exit(1)
+
+        with open(products_file, "r") as f:
+            data = json.load(f)
+
+        products = data.get("products", [])
+
+        if not products:
+            print("❌ No products in products.json")
+            sys.exit(1)
+
+        # Filter out example entries
+        products = [p for p in products if p["id"] != "EXAMPLE_PRODUCT_ID"]
+
+        if not products:
+            print("❌ Only example products found. Add real CJ product IDs.")
+            sys.exit(1)
+
+        print(f"📋 Loaded {len(products)} products to watch")
+        return products
+
+    def check_single_product(self, product_config: dict) -> list:
+        """
+        Check a single product's price and compare with history.
+        Returns list of price changes detected.
+        """
+        product_id = product_config["id"]
+        custom_name = product_config.get("name", "")
+        changes = []
+
+        print(f"\n🔍 Checking: {custom_name or product_id}...")
+
+        # Fetch current product data from CJ API
+        product_data = self.api.get_product_detail(product_id)
+
+        if not product_data:
+            print(f"   ⚠️  Could not fetch data for {product_id}")
+            return changes
+
+        product_name = custom_name or product_data.get("product_name", "Unknown")
+
+        # --- Check BASE product price ---
+        current_price = product_data.get("sell_price", 0)
+
+        if current_price > 0:
+            # Get last known price from database
+            last_record = self.db.get_last_price(product_id, "base")
+            old_price = last_record["sell_price"] if last_record else None
+
+            # Save current price
+            self.db.save_price({
+                "product_id": product_id,
+                "product_name": product_name,
+                "variant_id": "base",
+                "variant_name": "Base Product",
+                "sell_price": current_price,
+                "original_price": product_data.get("original_price", 0),
+                "member_price": product_data.get("member_price", 0),
+                "shipping_price": 0,
+                "total_cost": current_price,
+                "stock_status": product_data.get("stock_status", "unknown"),
+                "raw_data": product_data.get("raw_data", {}),
+            })
+
+            # Compare prices
+            change = self.analyzer.compare_prices(
+                product_id=product_id,
+                product_name=product_name,
+                variant_id="base",
+                variant_name="Base Product",
+                old_price=old_price,
+                new_price=current_price,
+            )
+
+            if change:
+                self.db.save_price_change(change)
+                changes.append(change)
+                print(f"   💰 CHANGE: ${old_price:.2f} → ${current_price:.2f} ({change['percent_change']:+.1f}%)")
+            else:
+                status = f"${current_price:.2f}"
+                if old_price is not None:
+                    status += " (no change)"
+                else:
+                    status += " (first check)"
+                print(f"   ✅ Price: {status}")
+
+        # --- Check VARIANT prices ---
+        if Config.TRACK_VARIANTS and product_data.get("variants"):
+            for variant in product_data["variants"]:
+                v_id = variant.get("variant_id", "")
+                v_name = variant.get("variant_name", "Unknown Variant")
+                v_price = variant.get("sell_price", 0)
+
+                if not v_id or v_price <= 0:
+                    continue
+
+                last_v_record = self.db.get_last_price(product_id, v_id)
+                old_v_price = last_v_record["sell_price"] if last_v_record else None
+
+                # Save variant price
+                self.db.save_price({
+                    "product_id": product_id,
+                    "product_name": product_name,
+                    "variant_id": v_id,
+                    "variant_name": v_name,
+                    "sell_price": v_price,
+                    "original_price": variant.get("original_price", 0),
+                    "member_price": variant.get("member_price", 0),
+                    "shipping_price": 0,
+                    "total_cost": v_price,
+                    "stock_status": variant.get("stock_status", "unknown"),
+                    "stock_quantity": variant.get("stock_quantity", 0),
+                })
+
+                # Compare
+                v_change = self.analyzer.compare_prices(
+                    product_id=product_id,
+                    product_name=product_name,
+                    variant_id=v_id,
+                    variant_name=v_name,
+                    old_price=old_v_price,
+                    new_price=v_price,
+                )
+
+                if v_change:
+                    self.db.save_price_change(v_change)
+                    changes.append(v_change)
+                    print(f"   💰 Variant [{v_name}]: ${old_v_price:.2f} → ${v_price:.2f}")
+
+                # Check stock status changes
+                if last_v_record:
+                    old_stock = last_v_record.get("stock_status", "unknown")
+                    new_stock = variant.get("stock_status", "unknown")
+                    if old_stock != new_stock and old_stock != "unknown":
+                        self.notifier.notify_stock_change(
+                            f"{product_name} ({v_name})",
+                            old_stock,
+                            new_stock,
+                        )
+
+        return changes
+
+    def check_all_products(self) -> list:
+        """Check all products and return all detected changes."""
+        print("\n" + "=" * 60)
+        print(f"🕐 Price check started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"📋 Checking {len(self.products)} products...")
+        print("=" * 60)
+
+        all_changes = []
+
+        for product_config in self.products:
+            if not self.running:
+                break
+
+            try:
+                changes = self.check_single_product(product_config)
+                all_changes.extend(changes)
+            except Exception as e:
+                print(f"   ❌ Error checking {product_config.get('name', product_config['id'])}: {e}")
+
+        # Send notifications for all changes
+        if all_changes:
+            self.notifier.notify_price_changes(all_changes)
+
+        print(f"\n✅ Check complete. {len(all_changes)} change(s) detected.")
+        return all_changes
+
+    def run_continuous(self):
+        """Run price checks continuously at configured interval."""
+        interval = Config.CHECK_INTERVAL
+
+        print("\n" + "=" * 60)
+        print("🚀 CJ DROPSHIPPING PRICE WATCHER")
+        print("=" * 60)
+        print(f"📋 Products:    {len(self.products)}")
+        print(f"⏱  Interval:    {interval}s ({interval // 60}min)")
+        print(f"📊 Min Change:  {Config.MIN_CHANGE_PERCENT}%")
+        print(f"🔀 Variants:    {'Yes' if Config.TRACK_VARIANTS else 'No'}")
+        print(f"💾 Database:    {Config.DB_PATH}")
+        print("=" * 60)
+        print("Press Ctrl+C to stop\n")
+
+        # Test API connection first
+        if not self.api.test_connection():
+            print("\n❌ Cannot connect to CJ API. Check credentials in .env")
+            sys.exit(1)
+
+        while self.running:
+            try:
+                self.check_all_products()
+
+                if self.running:
+                    next_check = datetime.now().strftime('%H:%M:%S')
+                    print(f"\n⏳ Next check in {interval}s (at ~{next_check})...")
+
+                    # Sleep in small increments for responsive shutdown
+                    for _ in range(interval):
+                        if not self.running:
+                            break
+                        time.sleep(1)
+
+            except KeyboardInterrupt:
+                break
+            except Exception as e:
+                print(f"\n❌ Error in main loop: {e}")
+                print("Retrying in 60 seconds...")
+                time.sleep(60)
+
+        print("👋 Watcher stopped.")
+
+    def show_history(self, days: int = 7):
+        """Display recent price change history."""
+        changes = self.db.get_recent_changes(days=days)
+
+        if not changes:
+            print(f"\nNo price changes in the last {days} days.")
+            return
+
+        print(f"\n📊 Price Changes (Last {days} Days)")
+        print("=" * 70)
+
+        for c in changes:
+            if c["change_type"] == "PRICE_DROP":
+                emoji = "📉🟢"
+            else:
+                emoji = "📈🔴"
+
+            print(
+                f"{emoji} [{c['detected_at'][:16]}] {c['product_name']} "
+                f"${c['old_price']:.2f}→${c['new_price']:.2f} "
+                f"({c['percent_change']:+.1f}%)"
+            )
+
+            if c["variant_id"] != "base":
+                print(f"     Variant: {c['variant_name']}")
+
+    def show_summary(self):
+        """Show summary of all tracked products."""
+        products = self.db.get_all_products_summary()
+
+        if not products:
+            print("\nNo products tracked yet. Run a check first.")
+            return
+
+        print(f"\n📋 Tracked Products Summary")
+        print("=" * 70)
+
+        for p in products:
+            stats = self.db.get_price_stats(p["product_id"], p.get("variant_id", "base"))
+            history = self.db.get_price_history(p["product_id"], p.get("variant_id", "base"))
+            trend = self.analyzer.analyze_trend(history)
+
+            trend_emoji = {
+                "rising": "📈🔴",
+                "falling": "📉🟢",
+                "stable": "➡️⚪",
+            }.get(trend.get("trend", ""), "❓")
+
+            print(f"\n{trend_emoji} {p['product_name']}")
+
+            if p.get("variant_id", "base") != "base":
+                print(f"   Variant: {p.get('variant_name', 'N/A')}")
+
+            print(f"   Current:  ${p['sell_price']:.2f}")
+
+            if stats.get("min_price"):
+                print(f"   Low/High: ${stats['min_price']:.2f} / ${stats['max_price']:.2f}")
+                print(f"   Average:  ${stats['avg_price']:.2f}")
+                print(f"   Checks:   {stats['data_points']}")
+
+            if trend.get("is_at_lowest"):
+                print(f"   ⭐ AT ALL-TIME LOW!")
+            elif trend.get("is_at_highest"):
+                print(f"   ⚠️  AT ALL-TIME HIGH!")
+
+    def search_and_add(self, keyword: str):
+        """Search CJ for products and optionally add them to watch list."""
+        print(f"\n🔍 Searching CJ for: '{keyword}'...")
+
+        if not self.api.test_connection():
+            print("❌ Cannot connect to CJ API.")
+            return
+
+        results = self.api.search_products(keyword)
+
+        if not results:
+            print("No products found.")
+            return
+
+        print(f"\n📦 Found {len(results)} products:\n")
+
+        for i, product in enumerate(results, 1):
+            print(f"  {i}. {product['product_name'][:60]}")
+            print(f"     ID: {product['product_id']}")
+            print(f"     Price: ${product['sell_price']:.2f}")
+            print(f"     URL: {product.get('product_url', 'N/A')}")
+            print()
+
+        # Prompt to add
+        try:
+            choice = input("Enter number(s) to add to watch list (comma-separated, or 'skip'): ")
+            if choice.lower() == "skip":
+                return
+
+            indices = [int(x.strip()) - 1 for x in choice.split(",")]
+            products_file = Path(Config.PRODUCTS_FILE)
+
+            with open(products_file, "r") as f:
+                data = json.load(f)
+
+            for idx in indices:
+                if 0 <= idx < len(results):
+                    product = results[idx]
+                    new_entry = {
+                        "id": product["product_id"],
+                        "name": product["product_name"][:80],
+                        "notes": f"Added via search on {datetime.now().strftime('%Y-%m-%d')}",
+                    }
+                    data["products"].append(new_entry)
+                    print(f"   ✅ Added: {product['product_name'][:60]}")
+
+            with open(products_file, "w") as f:
+                json.dump(data, f, indent=2)
+
+            print(f"\n📝 Updated {Config.PRODUCTS_FILE}")
+
+            # Reload products
+            self.products = self._load_products()
+
+        except (ValueError, EOFError):
+            print("Skipping.")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="CJDropshipping Product Price Watcher",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python main.py                    # Start continuous monitoring
+  python main.py --once             # Run one check and exit
+  python main.py --history          # Show recent price changes
+  python main.py --summary          # Show all tracked products
+  python main.py --search "camera"  # Search CJ and add products
+  python main.py --test             # Test API connection
+        """,
+    )
+
+    parser.add_argument(
+        "--once", action="store_true",
+        help="Run a single price check and exit",
+    )
+    parser.add_argument(
+        "--history", action="store_true",
+        help="Show recent price change history",
+    )
+    parser.add_argument(
+        "--days", type=int, default=7,
+        help="Number of days for history (default: 7)",
+    )
+    parser.add_argument(
+        "--summary", action="store_true",
+        help="Show summary of all tracked products",
+    )
+    parser.add_argument(
+        "--search", type=str,
+        help="Search CJ for products by keyword",
+    )
+    parser.add_argument(
+        "--test", action="store_true",
+        help="Test CJ API connection",
+    )
+    parser.add_argument(
+        "--add", type=str,
+        help="Manually add a product ID to watch list",
+    )
+    parser.add_argument(
+        "--add-name", type=str, default="",
+        help="Name for manually added product",
+    )
+
+    args = parser.parse_args()
+
+    watcher = CJPriceWatcher()
+
+    if args.test:
+        watcher.api.test_connection()
+
+    elif args.search:
+        watcher.search_and_add(args.search)
+
+    elif args.history:
+        watcher.show_history(days=args.days)
+
+    elif args.summary:
+        watcher.show_summary()
+
+    elif args.add:
+        products_file = Path(Config.PRODUCTS_FILE)
+        with open(products_file, "r") as f:
+            data = json.load(f)
+
+        new_entry = {
+            "id": args.add,
+            "name": args.add_name or args.add,
+            "notes": f"Manually added {datetime.now().strftime('%Y-%m-%d')}",
+        }
+        data["products"].append(new_entry)
+
+        with open(products_file, "w") as f:
+            json.dump(data, f, indent=2)
+
+        print(f"✅ Added product {args.add} to watch list")
+
+    elif args.once:
+        if not watcher.api.test_connection():
+            sys.exit(1)
+        watcher.check_all_products()
+
+    else:
+        watcher.run_continuous()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+## Quick Start Guide
+
+### 1️⃣ Install Dependencies
+```bash
+pip install -r requirements.txt
+```
+
+### 2️⃣ Get CJ API Credentials
+```
+1. Go to https://developers.cjdropshipping.com/
+2. Register / Login
+3. Create an application
+4. Copy your API key
+5. Paste into .env file
+```
+
+### 3️⃣ Find Product IDs
+```bash
+# Option A: Search directly from the tool
+python main.py --search "car phone mount"
+
+# Option B: From CJ website URL
+# https://cjdropshipping.com/product/1234567890ABCDEF.html
+#                                     ^^^^^^^^^^^^^^^^ this is the ID
+
+# Option C: Manually add by ID
+python main.py --add "1234567890ABCDEF" --add-name "My Product"
+```
+
+### 4️⃣ Add Products to Watch
+Edit `products.json`:
+```json
+{
+  "products": [
+    {
+      "id": "ACTUAL_CJ_PRODUCT_ID",
+      "name": "Bluetooth Car Speaker",
+      "notes": "Main product"
+    }
+  ]
+}
+```
+
+### 5️⃣ Run the Watcher
+```bash
+# Continuous monitoring
+python main.py
+
+# Single check
+python main.py --once
+
+# View history
+python main.py --history --days 30
+
+# View all products summary
+python main.py --summary
+```
+
+---
+
+## All CLI Commands
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ Command                          │ Description              │
+├──────────────────────────────────┼──────────────────────────┤
+│ python main.py                   │ Start continuous monitor │
+│ python main.py --once            │ Single price check       │
+│ python main.py --test            │ Test CJ API connection   │
+│ python main.py --search "term"   │ Search & add products    │
+│ python main.py --add "ID"        │ Add product by ID        │
+│ python main.py --history         │ Show price changes       │
+│ python main.py --history --days 30│ Changes in last 30 days │
+│ python main.py --summary         │ All products overview    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## How It Works
+
+```
+┌──────────────┐     ┌──────────────┐     ┌───────────────┐
+│ products.json│────→│  CJ API      │────→│ Price Compare │
+│ (your list)  │     │  (fetch data)│     │ (old vs new)  │
+└──────────────┘     └──────────────┘     └───────┬───────┘
+                                                  │
+                            ┌─────────────────────┼────────┐
+                            │                     │        │
+                     ┌──────▼──────┐   ┌──────────▼──┐  ┌──▼──────┐
+                     │  SQLite DB  │   │ Notifications│  │ Console │
+                     │  (history)  │   │ Discord/Email│  │ Output  │
+                     │             │   │ Telegram     │  │         │
+                     └─────────────┘   └─────────────┘  └─────────┘
+```
+
+Every check cycle the bot **fetches current prices → compares with the last stored price → saves to database → alerts you if the change exceeds your threshold**. Variant-level pricing (color, size, etc.) is tracked independently so you catch changes at every level.
